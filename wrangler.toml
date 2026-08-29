@@ -1,5 +1,5 @@
 name = "limonach-game-event-worker"
-main = "src/index.js"
+main = "worker.js"
 compatibility_date = "2026-08-29"
 
 [[d1_databases]]
