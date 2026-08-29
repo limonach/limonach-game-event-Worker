@@ -1,0 +1,8 @@
+name = "limonach-auth"
+main = "src/index.js"
+compatibility_date = "2026-08-29"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "limonach-db"
+database_id = "YOUR_D1_DATABASE_ID"
