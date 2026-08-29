@@ -1,4 +1,4 @@
-name = "limonach-auth"
+name = "limonach-game-event-worker"
 main = "src/index.js"
 compatibility_date = "2026-08-29"
 
