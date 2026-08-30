@@ -272,7 +272,8 @@ async function handleGoogleCallback(request, env) {
     maxAge: sessionDuration,
     httpOnly: true,
     secure: true,
-    sameSite: "Lax",
+    sameSite: "None", // frontend (pages.dev) and worker (workers.dev) are different sites
+    partitioned: true, // CHIPS — survives third-party cookie restrictions in modern browsers
     path: "/",
   });
   appendSetCookie(headers, "oauth_state", "", {
@@ -325,7 +326,8 @@ async function handleLogout(request, env) {
     maxAge: 0,
     httpOnly: true,
     secure: true,
-    sameSite: "Lax",
+    sameSite: "None",
+    partitioned: true,
     path: "/",
   });
   return response;
@@ -532,6 +534,7 @@ function appendSetCookie(headers, name, value, opts) {
   if (opts.httpOnly) cookie += "; HttpOnly";
   if (opts.secure) cookie += "; Secure";
   if (opts.sameSite) cookie += `; SameSite=${opts.sameSite}`;
+  if (opts.partitioned) cookie += "; Partitioned";
   headers.append("Set-Cookie", cookie);
 }
 
