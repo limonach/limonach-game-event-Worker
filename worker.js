@@ -1,8 +1,8 @@
 /**
- * worker.js — Cloudflare Worker: Google OAuth authentication backend
+ * worker.js — Cloudflare Worker: auth + arcade/wallet/tournaments backend
  * for a game competitions app. Data layer: Supabase (Postgres via
- * PostgREST, accessed with the service_role key — RLS on both tables
- * denies anon/authenticated entirely; see schema.sql).
+ * PostgREST, accessed with the service_role key — RLS on every table
+ * denies anon/authenticated entirely; see schema.sql + schema_arcade.sql).
  *
  * Bindings expected (see wrangler.toml):
  *   RATE_LIMIT   - KV namespace used for rate limiting
@@ -16,7 +16,7 @@
  * Vars (wrangler.toml [vars]):
  *   ALLOWED_ORIGIN
  *   SUPABASE_URL                - not secret, but keep out of frontend anyway
- *   TURNSTILE_SITE_KEY           - public by design, safe in frontend/vars
+ *   TURNSTILE_SITE_KEY          - public by design, safe in frontend/vars
  *   SESSION_DURATION_SECONDS (optional, defaults below)
  */
 
@@ -30,21 +30,27 @@ const OAUTH_STATE_TTL_SECONDS = 5 * 60; // 5 minutes
 const SESSION_TOUCH_THRESHOLD_SECONDS = 5 * 60; // only rewrite last_used_at if stale by this much
 const MAX_REQUEST_BODY_BYTES = 10 * 1024; // 10 KB — this API doesn't need large bodies
 
-const RATE_LIMITS = {
-  "/auth/google": { limit: 15, windowSeconds: 60 },
-  "/auth/google/callback": { limit: 15, windowSeconds: 60 },
-  "/auth/logout": { limit: 30, windowSeconds: 60 },
-  "/auth/me": { limit: 90, windowSeconds: 60 },
-  default: { limit: 60, windowSeconds: 60 },
-};
+// [تخمين] لا توجد طريقة حالية لكسب LIM (الإعلانات غير مفعّلة بعد)، فبدون
+// رصيد ترحيبي لن يستطيع أي مستخدم تجربة الانضمام لأي بطولة. غيّرها لـ 0
+// إن كنت لا تريد رصيدًا ترحيبيًا. تُمنح مرة واحدة فقط عند أول تسجيل دخول.
+const WELCOME_BONUS_LIM = 10;
 
-const ALLOWED_METHODS_BY_ROUTE = {
-  "/auth/google": ["GET"],
-  "/auth/google/callback": ["GET"],
-  "/auth/me": ["GET"],
-  "/auth/logout": ["POST"],
-  "/health": ["GET"],
-};
+// ---------------------------------------------------------------------
+// جدول التوجيه — كل مسار: تعبير نمطي + طريقة HTTP + معالج + حد معدّل خاص به.
+// اختيار regex بدل switch بسيط لأن /tournaments/:id ديناميكي.
+// ---------------------------------------------------------------------
+const ROUTES = [
+  { name: "health", method: "GET", pattern: /^\/health$/, handler: handleHealth, rate: { limit: 120, windowSeconds: 60 } },
+  { name: "auth_google_start", method: "GET", pattern: /^\/auth\/google$/, handler: startGoogleOAuth, rate: { limit: 15, windowSeconds: 60 } },
+  { name: "auth_google_callback", method: "GET", pattern: /^\/auth\/google\/callback$/, handler: handleGoogleCallback, rate: { limit: 15, windowSeconds: 60 } },
+  { name: "auth_me", method: "GET", pattern: /^\/auth\/me$/, handler: handleMe, rate: { limit: 90, windowSeconds: 60 } },
+  { name: "auth_logout", method: "POST", pattern: /^\/auth\/logout$/, handler: handleLogout, rate: { limit: 30, windowSeconds: 60 } },
+  { name: "games_list", method: "GET", pattern: /^\/games$/, handler: handleListGames, rate: { limit: 60, windowSeconds: 60 } },
+  { name: "tournaments_list", method: "GET", pattern: /^\/tournaments$/, handler: handleListTournaments, rate: { limit: 60, windowSeconds: 60 } },
+  { name: "tournament_detail", method: "GET", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})$/, handler: handleGetTournament, rate: { limit: 60, windowSeconds: 60 } },
+  { name: "tournament_join", method: "POST", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})\/join$/, handler: handleJoinTournament, rate: { limit: 8, windowSeconds: 60 } },
+  { name: "tournament_winners", method: "GET", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})\/winners$/, handler: handleTournamentWinners, rate: { limit: 60, windowSeconds: 60 } },
+];
 
 // ---------------------------------------------------------------------
 // Entry point
@@ -55,19 +61,16 @@ export default {
       return await handleRequest(request, env, ctx);
     } catch (err) {
       console.error("unhandled_error", err && err.message ? err.message : "unknown");
-      return errorResponse("INTERNAL_ERROR", "Something went wrong. Please try again.", 500, request, env);
+      return withSecurityAndCors(errorResponse("INTERNAL_ERROR", "Something went wrong. Please try again.", 500), request, env);
     }
   },
 
   // Runs on the configured cron schedule (see wrangler.toml [triggers]).
-  // Expired-session cleanup happens HERE, not on the request path.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(cleanupExpiredSessions(env));
   },
 };
 
-// One client per request. supabase-js is fetch-based (no persistent
-// socket to reuse across isolates anyway), so this is cheap.
 function getSupabase(env) {
   return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -78,60 +81,53 @@ async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // --- Reject disallowed HTTP methods per route -----------------------
-  const allowedMethods = ALLOWED_METHODS_BY_ROUTE[path];
-  if (allowedMethods && !allowedMethods.includes(request.method) && request.method !== "OPTIONS") {
-    return errorResponse("METHOD_NOT_ALLOWED", "This method is not allowed on this route.", 405, request, env);
-  }
-
-  // --- CORS preflight ---------------------------------------------------
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: buildCorsHeaders(request, env) });
   }
 
-  // --- Body size guard ----------------------------------------------------
   const contentLength = request.headers.get("content-length");
   if (contentLength && Number(contentLength) > MAX_REQUEST_BODY_BYTES) {
-    return errorResponse("PAYLOAD_TOO_LARGE", "Request body too large.", 413, request, env);
+    return withSecurityAndCors(errorResponse("PAYLOAD_TOO_LARGE", "Request body too large.", 413), request, env);
   }
 
-  // --- Rate limiting (per-IP, per-route) --------------------------------
-  const rateLimited = await isRateLimited(request, env, path);
+  const matchedByPath = ROUTES.filter((r) => r.pattern.test(path));
+  if (matchedByPath.length === 0) {
+    return withSecurityAndCors(errorResponse("NOT_FOUND", "Not found.", 404), request, env);
+  }
+
+  const route = matchedByPath.find((r) => r.method === request.method);
+  if (!route) {
+    return withSecurityAndCors(errorResponse("METHOD_NOT_ALLOWED", "This method is not allowed on this route.", 405), request, env);
+  }
+
+  const rateLimited = await isRateLimited(request, env, route.name, route.rate);
   if (rateLimited) {
-    return errorResponse("RATE_LIMITED", "Too many requests. Please slow down.", 429, request, env);
+    return withSecurityAndCors(errorResponse("RATE_LIMITED", "Too many requests. Please slow down.", 429), request, env);
   }
 
+  const match = path.match(route.pattern);
   let response;
-  switch (path) {
-    case "/health":
-      response = jsonResponse({ success: true, status: "ok" }, 200);
-      break;
-    case "/auth/google":
-      response = await startGoogleOAuth(request, env);
-      break;
-    case "/auth/google/callback":
-      response = await handleGoogleCallback(request, env);
-      break;
-    case "/auth/me":
-      response = await handleMe(request, env);
-      break;
-    case "/auth/logout":
-      response = await handleLogout(request, env);
-      break;
-    default:
-      response = errorResponse("NOT_FOUND", "Not found.", 404, request, env);
+  try {
+    response = await route.handler(request, env, match);
+  } catch (err) {
+    console.error("route_handler_error", route.name, err && err.message);
+    response = errorResponse("INTERNAL_ERROR", "Something went wrong. Please try again.", 500);
   }
 
   return withSecurityAndCors(response, request, env);
 }
 
 // =====================================================================
-// /auth/google — start the OAuth flow
+// /health
+// =====================================================================
+async function handleHealth() {
+  return jsonResponse({ success: true, status: "ok" }, 200);
+}
+
+// =====================================================================
+// /auth/google — start the OAuth flow (Turnstile-gated)
 // =====================================================================
 async function startGoogleOAuth(request, env) {
-  // Bot protection gate: the frontend renders a Turnstile widget and appends
-  // its token as ?cf-turnstile-response=... on the "Continue with Google"
-  // link. Verified server-side here, BEFORE we ever redirect to Google.
   const url = new URL(request.url);
   const turnstileToken = url.searchParams.get("cf-turnstile-response");
   const ip = request.headers.get("cf-connecting-ip") || "";
@@ -165,7 +161,7 @@ async function startGoogleOAuth(request, env) {
 }
 
 // =====================================================================
-// /auth/google/callback — exchange code, verify identity, create session
+// /auth/google/callback
 // =====================================================================
 async function handleGoogleCallback(request, env) {
   const url = new URL(request.url);
@@ -173,12 +169,10 @@ async function handleGoogleCallback(request, env) {
   const returnedState = url.searchParams.get("state");
   const cookieState = getCookie(request, "oauth_state");
 
-  // 1) CSRF protection: state must exist, match, and come from our own cookie.
   if (!code || !returnedState || !cookieState || returnedState !== cookieState) {
-    return errorResponse("INVALID_STATE", "Login request could not be verified.", 400, request, env);
+    return errorResponse("INVALID_STATE", "Login request could not be verified.", 400);
   }
 
-  // 2) Exchange the authorization code for tokens.
   let tokenData;
   try {
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
@@ -196,24 +190,23 @@ async function handleGoogleCallback(request, env) {
     tokenData = await tokenRes.json();
   } catch (err) {
     console.error("oauth_token_exchange_error");
-    return errorResponse("OAUTH_FAILED", "Google sign-in failed. Please try again.", 502, request, env);
+    return errorResponse("OAUTH_FAILED", "Google sign-in failed. Please try again.", 502);
   }
 
   if (!tokenData.id_token) {
-    return errorResponse("OAUTH_FAILED", "Google sign-in failed. Please try again.", 502, request, env);
+    return errorResponse("OAUTH_FAILED", "Google sign-in failed. Please try again.", 502);
   }
 
-  // 3) Verify the ID token's SIGNATURE (not just decode it) + claims.
   let claims;
   try {
     claims = await verifyGoogleIdToken(tokenData.id_token, env);
   } catch (err) {
     console.error("id_token_verification_failed", err && err.message);
-    return errorResponse("INVALID_TOKEN", "Google sign-in could not be verified.", 401, request, env);
+    return errorResponse("INVALID_TOKEN", "Google sign-in could not be verified.", 401);
   }
 
   if (!claims.email_verified) {
-    return errorResponse("EMAIL_NOT_VERIFIED", "Your Google email is not verified.", 403, request, env);
+    return errorResponse("EMAIL_NOT_VERIFIED", "Your Google email is not verified.", 403);
   }
 
   const googleId = claims.sub;
@@ -224,10 +217,6 @@ async function handleGoogleCallback(request, env) {
 
   const supabase = getSupabase(env);
 
-  // 4) Atomic upsert. Only google_id/email/name/avatar_url/last_login_at
-  //    are in the payload — id, created_at and status are deliberately
-  //    left out so an existing user's id/join-date/account status are
-  //    never overwritten by this login-time upsert.
   const { data: user, error: upsertError } = await supabase
     .from("users")
     .upsert(
@@ -238,17 +227,26 @@ async function handleGoogleCallback(request, env) {
     .single();
 
   if (upsertError || !user) {
-    // Most likely cause: email already registered under a different google_id
-    // (separate UNIQUE constraint, not covered by the google_id conflict target).
     console.error("user_upsert_failed");
-    return errorResponse("ACCOUNT_CONFLICT", "This email is already associated with another account.", 409, request, env);
+    return errorResponse("ACCOUNT_CONFLICT", "This email is already associated with another account.", 409);
   }
 
   if (user.status !== "active") {
-    return errorResponse("ACCOUNT_DISABLED", "This account is not active.", 403, request, env);
+    return errorResponse("ACCOUNT_DISABLED", "This account is not active.", 403);
   }
 
-  // 5) Create a session. Store only a hash of the token.
+  // Wallet: created once, with a welcome bonus. ignoreDuplicates means a
+  // returning user's balance is NEVER touched by this login-time upsert.
+  const { error: walletError } = await supabase
+    .from("wallets")
+    .upsert({ user_id: user.id, balance: WELCOME_BONUS_LIM }, { onConflict: "user_id", ignoreDuplicates: true });
+
+  if (walletError) {
+    console.error("wallet_upsert_failed");
+    // Not fatal to login — the user can still sign in even if this
+    // particular write failed; /auth/me will just show balance 0.
+  }
+
   const sessionDuration = Number(env.SESSION_DURATION_SECONDS) || DEFAULT_SESSION_DURATION_SECONDS;
   const rawToken = randomHex(32);
   const tokenHash = await sha256Hex(rawToken + env.SESSION_SECRET);
@@ -263,17 +261,16 @@ async function handleGoogleCallback(request, env) {
 
   if (sessionError) {
     console.error("session_insert_failed");
-    return errorResponse("OAUTH_FAILED", "Google sign-in failed. Please try again.", 502, request, env);
+    return errorResponse("OAUTH_FAILED", "Google sign-in failed. Please try again.", 502);
   }
 
-  // 6) Set the session cookie and clear the now-used state cookie.
   const headers = new Headers({ Location: env.ALLOWED_ORIGIN });
   appendSetCookie(headers, "session", rawToken, {
     maxAge: sessionDuration,
     httpOnly: true,
     secure: true,
     sameSite: "None", // frontend (pages.dev) and worker (workers.dev) are different sites
-    partitioned: true, // CHIPS — survives third-party cookie restrictions in modern browsers
+    partitioned: true,
     path: "/",
   });
   appendSetCookie(headers, "oauth_state", "", {
@@ -288,13 +285,21 @@ async function handleGoogleCallback(request, env) {
 }
 
 // =====================================================================
-// /auth/me
+// /auth/me — user + wallet balance (two small queries; kept separate
+// rather than a nested PostgREST embed for predictability/debuggability)
 // =====================================================================
 async function handleMe(request, env) {
   const session = await resolveSession(request, env);
   if (!session) {
-    return errorResponse("UNAUTHENTICATED", "Not signed in.", 401, request, env);
+    return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
   }
+
+  const supabase = getSupabase(env);
+  const { data: wallet } = await supabase
+    .from("wallets")
+    .select("balance")
+    .eq("user_id", session.user_id)
+    .maybeSingle();
 
   return jsonResponse(
     {
@@ -305,6 +310,7 @@ async function handleMe(request, env) {
         name: session.name,
         avatar_url: session.avatar_url,
       },
+      wallet: { balance: wallet ? wallet.balance : 0 },
     },
     200
   );
@@ -334,6 +340,187 @@ async function handleLogout(request, env) {
 }
 
 // =====================================================================
+// /games — catalog (Free Fire active, others coming_soon/inactive)
+// =====================================================================
+async function handleListGames(request, env) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const supabase = getSupabase(env);
+  const { data, error } = await supabase
+    .from("games")
+    .select("id, name, status, icon_emoji, sort_order")
+    .order("sort_order", { ascending: true });
+
+  if (error) {
+    console.error("games_list_failed");
+    return errorResponse("INTERNAL_ERROR", "Could not load games.", 500);
+  }
+
+  return jsonResponse({ success: true, games: data }, 200);
+}
+
+// =====================================================================
+// /tournaments?game=slug — list, with participant_count + joined flag
+// computed in one extra batched query (no N+1).
+// =====================================================================
+async function handleListTournaments(request, env) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const url = new URL(request.url);
+  const gameId = url.searchParams.get("game");
+
+  const supabase = getSupabase(env);
+  let query = supabase
+    .from("tournaments")
+    .select("id, game_id, title, description, entry_fee_lim, max_participants, status, starts_at, ends_at")
+    .order("starts_at", { ascending: true });
+
+  if (gameId) query = query.eq("game_id", gameId);
+
+  const { data: tournaments, error } = await query;
+  if (error) {
+    console.error("tournaments_list_failed");
+    return errorResponse("INTERNAL_ERROR", "Could not load tournaments.", 500);
+  }
+
+  const ids = tournaments.map((t) => t.id);
+  const entryCounts = {};
+  const joinedSet = new Set();
+
+  if (ids.length > 0) {
+    const { data: entries } = await supabase
+      .from("tournament_entries")
+      .select("tournament_id, user_id")
+      .in("tournament_id", ids);
+
+    (entries || []).forEach((e) => {
+      entryCounts[e.tournament_id] = (entryCounts[e.tournament_id] || 0) + 1;
+      if (e.user_id === session.user_id) joinedSet.add(e.tournament_id);
+    });
+  }
+
+  const result = tournaments.map((t) => ({
+    ...t,
+    participant_count: entryCounts[t.id] || 0,
+    joined: joinedSet.has(t.id),
+  }));
+
+  return jsonResponse({ success: true, tournaments: result }, 200);
+}
+
+// =====================================================================
+// /tournaments/:id
+// =====================================================================
+async function handleGetTournament(request, env, match) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const tournamentId = match[1];
+  const supabase = getSupabase(env);
+
+  const { data: tournament, error } = await supabase
+    .from("tournaments")
+    .select("id, game_id, title, description, entry_fee_lim, max_participants, status, starts_at, ends_at")
+    .eq("id", tournamentId)
+    .maybeSingle();
+
+  if (error || !tournament) return errorResponse("NOT_FOUND", "Tournament not found.", 404);
+
+  const { count } = await supabase
+    .from("tournament_entries")
+    .select("id", { count: "exact", head: true })
+    .eq("tournament_id", tournamentId);
+
+  const { data: myEntry } = await supabase
+    .from("tournament_entries")
+    .select("id")
+    .eq("tournament_id", tournamentId)
+    .eq("user_id", session.user_id)
+    .maybeSingle();
+
+  return jsonResponse(
+    { success: true, tournament: { ...tournament, participant_count: count || 0, joined: !!myEntry } },
+    200
+  );
+}
+
+// =====================================================================
+// POST /tournaments/:id/join — the only mutating, money-adjacent route.
+// All the actual atomicity lives in the join_tournament() SQL function;
+// this handler just validates input and translates DB errors to codes.
+// =====================================================================
+async function handleJoinTournament(request, env, match) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const tournamentId = match[1];
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return errorResponse("INVALID_INPUT", "Request body must be valid JSON.", 400);
+  }
+
+  const gameUsername = typeof body.game_username === "string" ? body.game_username.trim() : "";
+  const gameUid = typeof body.game_uid === "string" ? body.game_uid.trim() : "";
+
+  if (!gameUsername || gameUsername.length > 60) {
+    return errorResponse("INVALID_INPUT", "A valid game username is required.", 400);
+  }
+  if (!gameUid || gameUid.length > 60) {
+    return errorResponse("INVALID_INPUT", "A valid game ID is required.", 400);
+  }
+
+  const supabase = getSupabase(env);
+  const { data, error } = await supabase.rpc("join_tournament", {
+    p_user_id: session.user_id,
+    p_tournament_id: tournamentId,
+    p_game_username: gameUsername,
+    p_game_uid: gameUid,
+  });
+
+  if (error) {
+    const msg = error.message || "";
+    if (msg.includes("INSUFFICIENT_BALANCE")) return errorResponse("INSUFFICIENT_BALANCE", "Not enough LIM to join this tournament.", 402);
+    if (msg.includes("ALREADY_JOINED")) return errorResponse("ALREADY_JOINED", "You already joined this tournament.", 409);
+    if (msg.includes("TOURNAMENT_FULL")) return errorResponse("TOURNAMENT_FULL", "This tournament is full.", 409);
+    if (msg.includes("TOURNAMENT_NOT_ACTIVE")) return errorResponse("TOURNAMENT_NOT_ACTIVE", "This tournament is not open for entries.", 409);
+    if (msg.includes("TOURNAMENT_NOT_FOUND")) return errorResponse("NOT_FOUND", "Tournament not found.", 404);
+    console.error("join_tournament_failed", msg);
+    return errorResponse("INTERNAL_ERROR", "Could not join tournament.", 500);
+  }
+
+  const newBalance = Array.isArray(data) && data[0] ? data[0].new_balance : null;
+  return jsonResponse({ success: true, balance: newBalance }, 200);
+}
+
+// =====================================================================
+// /tournaments/:id/winners — admin-populated (see README)
+// =====================================================================
+async function handleTournamentWinners(request, env, match) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const tournamentId = match[1];
+  const supabase = getSupabase(env);
+  const { data, error } = await supabase
+    .from("tournament_winners")
+    .select("placement, display_name, photo_url, note")
+    .eq("tournament_id", tournamentId)
+    .order("placement", { ascending: true });
+
+  if (error) {
+    console.error("winners_list_failed");
+    return errorResponse("INTERNAL_ERROR", "Could not load winners.", 500);
+  }
+
+  return jsonResponse({ success: true, winners: data }, 200);
+}
+
+// =====================================================================
 // Session resolution — ONE PostgREST call (embedded join sessions→users).
 // user_id is NEVER accepted from the client; it always comes from this
 // server-side lookup keyed by the hashed cookie token.
@@ -355,7 +542,6 @@ async function resolveSession(request, env) {
 
   if (error || !row || !row.users || row.users.status !== "active") return null;
 
-  // Throttled write: only touch last_used_at if it's meaningfully stale.
   const staleSeconds = (Date.now() - new Date(row.last_used_at).getTime()) / 1000;
   if (staleSeconds > SESSION_TOUCH_THRESHOLD_SECONDS) {
     await supabase.from("sessions").update({ last_used_at: nowIso }).eq("id", row.id);
@@ -371,8 +557,7 @@ async function resolveSession(request, env) {
 }
 
 // =====================================================================
-// Cloudflare Turnstile verification
-// Fails closed: any error, missing secret, or missing token = rejected.
+// Cloudflare Turnstile verification — fails closed.
 // =====================================================================
 async function verifyTurnstile(token, ip, env) {
   if (!env.TURNSTILE_SECRET_KEY || !token) return false;
@@ -442,15 +627,15 @@ async function verifyGoogleIdToken(idToken, env) {
 }
 
 // =====================================================================
-// Rate limiting (KV based, per IP + route) — unaffected by the DB swap.
+// Rate limiting (KV based, per IP + route name) — approximate, not
+// strictly atomic across edge locations. See README for caveats.
 // =====================================================================
-async function isRateLimited(request, env, path) {
+async function isRateLimited(request, env, routeName, rule) {
   if (!env.RATE_LIMIT) return false;
 
-  const rule = RATE_LIMITS[path] || RATE_LIMITS.default;
   const ip = request.headers.get("cf-connecting-ip") || "unknown";
   const bucket = Math.floor(Date.now() / 1000 / rule.windowSeconds);
-  const key = `rl:${path}:${ip}:${bucket}`;
+  const key = `rl:${routeName}:${ip}:${bucket}`;
 
   const current = await env.RATE_LIMIT.get(key);
   const count = current ? parseInt(current, 10) : 0;
@@ -517,9 +702,8 @@ function jsonResponse(data, status) {
   });
 }
 
-function errorResponse(code, message, status, request, env) {
-  const res = jsonResponse({ success: false, error: code, message }, status);
-  return request && env ? withSecurityAndCors(res, request, env) : res;
+function errorResponse(code, message, status) {
+  return jsonResponse({ success: false, error: code, message }, status);
 }
 
 function getCookie(request, name) {
