@@ -270,7 +270,6 @@ async function handleGoogleCallback(request, env) {
     httpOnly: true,
     secure: true,
     sameSite: "None", // frontend (pages.dev) and worker (workers.dev) are different sites
-    partitioned: true,
     path: "/",
   });
   appendSetCookie(headers, "oauth_state", "", {
@@ -333,7 +332,6 @@ async function handleLogout(request, env) {
     httpOnly: true,
     secure: true,
     sameSite: "None",
-    partitioned: true,
     path: "/",
   });
   return response;
