@@ -21,6 +21,7 @@
  */
 
 import { createClient } from "@supabase/supabase-js";
+export { MatchmakingQueue, ThinkRushMatch } from "./think-rush.js";
 
 // ---------------------------------------------------------------------
 // Tunables
@@ -50,6 +51,8 @@ const ROUTES = [
   { name: "tournament_detail", method: "GET", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})$/, handler: handleGetTournament, rate: { limit: 60, windowSeconds: 60 } },
   { name: "tournament_join", method: "POST", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})\/join$/, handler: handleJoinTournament, rate: { limit: 8, windowSeconds: 60 } },
   { name: "tournament_winners", method: "GET", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})\/winners$/, handler: handleTournamentWinners, rate: { limit: 60, windowSeconds: 60 } },
+  { name: "wallet_transactions", method: "GET", pattern: /^\/wallet\/transactions$/, handler: handleWalletTransactions, rate: { limit: 60, windowSeconds: 60 } },
+  { name: "my_tournaments", method: "GET", pattern: /^\/me\/tournaments$/, handler: handleMyTournaments, rate: { limit: 60, windowSeconds: 60 } },
 ];
 
 // ---------------------------------------------------------------------
@@ -80,6 +83,13 @@ function getSupabase(env) {
 async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
+
+  // Think Rush's live matches are WebSocket, not JSON REST — handled
+  // entirely separately, before the normal route table / CORS wrapping,
+  // since a 101 Switching Protocols response must never be re-wrapped.
+  if (path === "/think-rush/connect") {
+    return handleThinkRushConnect(request, env);
+  }
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: buildCorsHeaders(request, env) });
@@ -296,7 +306,7 @@ async function handleMe(request, env) {
   const supabase = getSupabase(env);
   const { data: wallet } = await supabase
     .from("wallets")
-    .select("balance")
+    .select("balance, balance_usd")
     .eq("user_id", session.user_id)
     .maybeSingle();
 
@@ -309,7 +319,7 @@ async function handleMe(request, env) {
         name: session.name,
         avatar_url: session.avatar_url,
       },
-      wallet: { balance: wallet ? wallet.balance : 0 },
+      wallet: { balance: wallet ? wallet.balance : 0, balance_usd: wallet ? wallet.balance_usd : 0 },
     },
     200
   );
@@ -335,6 +345,59 @@ async function handleLogout(request, env) {
     path: "/",
   });
   return response;
+}
+
+// =====================================================================
+// Think Rush — WebSocket handshake: auth, origin check, rate limit,
+// claim a match slot from MatchmakingQueue, then proxy the upgrade
+// straight through to that match's Durable Object.
+// =====================================================================
+async function handleThinkRushConnect(request, env) {
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return withSecurityAndCors(errorResponse("BAD_REQUEST", "Expected a WebSocket upgrade.", 400), request, env);
+  }
+
+  // WebSocket upgrades aren't subject to browser CORS enforcement, so we
+  // check Origin ourselves — otherwise any site could open a game socket
+  // on behalf of a logged-in user using their browser's session cookie.
+  const origin = request.headers.get("Origin");
+  if (origin !== env.ALLOWED_ORIGIN) {
+    return withSecurityAndCors(errorResponse("FORBIDDEN", "Origin not allowed.", 403), request, env);
+  }
+
+  const session = await resolveSession(request, env);
+  if (!session) {
+    return withSecurityAndCors(errorResponse("UNAUTHENTICATED", "Not signed in.", 401), request, env);
+  }
+
+  const rateLimited = await isRateLimited(request, env, "think_rush_connect", { limit: 10, windowSeconds: 60 });
+  if (rateLimited) {
+    return withSecurityAndCors(errorResponse("RATE_LIMITED", "Too many requests. Please slow down.", 429), request, env);
+  }
+
+  let matchId, role;
+  try {
+    const queueStub = env.MATCHMAKING_QUEUE.get(env.MATCHMAKING_QUEUE.idFromName("global"));
+    const claimRes = await queueStub.fetch("https://internal/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: session.user_id }),
+    });
+    ({ matchId, role } = await claimRes.json());
+  } catch (err) {
+    console.error("think_rush_matchmaking_failed", err && err.message);
+    return withSecurityAndCors(errorResponse("INTERNAL_ERROR", "Could not start matchmaking.", 500), request, env);
+  }
+
+  const matchStub = env.THINK_RUSH_MATCH.get(env.THINK_RUSH_MATCH.idFromName(matchId));
+
+  const forwardHeaders = new Headers(request.headers);
+  forwardHeaders.set("X-User-Id", session.user_id);
+  forwardHeaders.set("X-Player-Role", role);
+
+  // Returned AS-IS: this is the 101 Switching Protocols response carrying
+  // the live WebSocket. It must not be touched by withSecurityAndCors.
+  return matchStub.fetch(new Request(request.url, { headers: forwardHeaders }));
 }
 
 // =====================================================================
@@ -420,7 +483,7 @@ async function handleGetTournament(request, env, match) {
 
   const { data: tournament, error } = await supabase
     .from("tournaments")
-    .select("id, game_id, title, description, entry_fee_lim, max_participants, status, starts_at, ends_at")
+    .select("id, game_id, title, description, rules, cover_image_url, entry_fee_lim, max_participants, status, starts_at, ends_at")
     .eq("id", tournamentId)
     .maybeSingle();
 
@@ -433,13 +496,28 @@ async function handleGetTournament(request, env, match) {
 
   const { data: myEntry } = await supabase
     .from("tournament_entries")
-    .select("id")
+    .select("id, group_number")
     .eq("tournament_id", tournamentId)
     .eq("user_id", session.user_id)
     .maybeSingle();
 
+  const { data: prizes } = await supabase
+    .from("tournament_prizes")
+    .select("placement, prize_description, prize_value_lim")
+    .eq("tournament_id", tournamentId)
+    .order("placement", { ascending: true });
+
   return jsonResponse(
-    { success: true, tournament: { ...tournament, participant_count: count || 0, joined: !!myEntry } },
+    {
+      success: true,
+      tournament: {
+        ...tournament,
+        participant_count: count || 0,
+        joined: !!myEntry,
+        my_group: myEntry ? myEntry.group_number : null,
+        prizes: prizes || [],
+      },
+    },
     200
   );
 }
@@ -516,6 +594,64 @@ async function handleTournamentWinners(request, env, match) {
   }
 
   return jsonResponse({ success: true, winners: data }, 200);
+}
+
+// =====================================================================
+// /wallet/transactions — the current user's own ledger only (user_id
+// comes from the session, never from a query param — no way to read
+// someone else's transactions by guessing an ID).
+// =====================================================================
+async function handleWalletTransactions(request, env) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const supabase = getSupabase(env);
+  const { data, error } = await supabase
+    .from("wallet_transactions")
+    .select("id, amount, type, currency, reference_id, created_at")
+    .eq("user_id", session.user_id)
+    .order("created_at", { ascending: false })
+    .limit(50);
+
+  if (error) {
+    console.error("wallet_tx_list_failed");
+    return errorResponse("INTERNAL_ERROR", "Could not load transactions.", 500);
+  }
+
+  return jsonResponse({ success: true, transactions: data }, 200);
+}
+
+// =====================================================================
+// /me/tournaments — every tournament the CURRENT user has joined, with
+// their own entry details. user_id comes from the session, same as
+// every other protected route — no way to list someone else's entries.
+// =====================================================================
+async function handleMyTournaments(request, env) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const supabase = getSupabase(env);
+  const { data, error } = await supabase
+    .from("tournament_entries")
+    .select("id, game_username, game_uid, group_number, joined_at, tournaments(id, title, game_id, status, starts_at, ends_at, entry_fee_lim)")
+    .eq("user_id", session.user_id)
+    .order("joined_at", { ascending: false });
+
+  if (error) {
+    console.error("my_tournaments_failed");
+    return errorResponse("INTERNAL_ERROR", "Could not load your tournaments.", 500);
+  }
+
+  const entries = (data || []).map((row) => ({
+    entry_id: row.id,
+    game_username: row.game_username,
+    game_uid: row.game_uid,
+    group_number: row.group_number,
+    joined_at: row.joined_at,
+    tournament: row.tournaments,
+  }));
+
+  return jsonResponse({ success: true, entries }, 200);
 }
 
 // =====================================================================

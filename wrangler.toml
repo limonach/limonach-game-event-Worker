@@ -8,11 +8,29 @@ compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
 # ---------------------------------------------------------------------
-# KV namespace used for rate limiting
+# KV namespace used for rate limiting — REPLACE id after running:
+#   wrangler kv namespace create RATE_LIMIT
 # ---------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
 id = "90b4297ff1a64a919c35b3e0b60cbe5f"
+
+# ---------------------------------------------------------------------
+# Durable Objects — real-time state for Think Rush matches. One
+# MatchmakingQueue instance total (singleton "global"), one
+# ThinkRushMatch instance per active match.
+# ---------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "MATCHMAKING_QUEUE"
+class_name = "MatchmakingQueue"
+
+[[durable_objects.bindings]]
+name = "THINK_RUSH_MATCH"
+class_name = "ThinkRushMatch"
+
+[[migrations]]
+tag = "v1-think-rush"
+new_classes = ["MatchmakingQueue", "ThinkRushMatch"]
 
 # ---------------------------------------------------------------------
 # Cron trigger: cleans up expired sessions once a day at 03:00 UTC.
