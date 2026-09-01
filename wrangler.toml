@@ -30,7 +30,7 @@ class_name = "ThinkRushMatch"
 
 [[migrations]]
 tag = "v1-think-rush"
-new_classes = ["MatchmakingQueue", "ThinkRushMatch"]
+new_sqlite_classes = ["MatchmakingQueue", "ThinkRushMatch"]
 
 # ---------------------------------------------------------------------
 # Cron trigger: cleans up expired sessions once a day at 03:00 UTC.
