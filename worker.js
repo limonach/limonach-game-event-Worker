@@ -306,7 +306,7 @@ async function handleMe(request, env) {
   const supabase = getSupabase(env);
   const { data: wallet } = await supabase
     .from("wallets")
-    .select("balance, balance_usd")
+    .select("balance, balance_usd, balance_gem")
     .eq("user_id", session.user_id)
     .maybeSingle();
 
@@ -319,7 +319,11 @@ async function handleMe(request, env) {
         name: session.name,
         avatar_url: session.avatar_url,
       },
-      wallet: { balance: wallet ? wallet.balance : 0, balance_usd: wallet ? wallet.balance_usd : 0 },
+      wallet: {
+        balance: wallet ? wallet.balance : 0,
+        balance_usd: wallet ? wallet.balance_usd : 0,
+        balance_gem: wallet ? wallet.balance_gem : 0,
+      },
     },
     200
   );
