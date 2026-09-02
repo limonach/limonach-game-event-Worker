@@ -289,7 +289,7 @@ async function handleGoogleCallback(request, env) {
     maxAge: sessionDuration,
     httpOnly: true,
     secure: true,
-    sameSite: "None", // frontend (pages.dev) and worker (workers.dev) are different sites
+    sameSite: "Lax", // safe now that /auth/* is proxied same-origin from pages.dev — see _worker.js
     path: "/",
   });
   appendSetCookie(headers, "oauth_state", "", {
@@ -355,7 +355,7 @@ async function handleLogout(request, env) {
     maxAge: 0,
     httpOnly: true,
     secure: true,
-    sameSite: "None",
+    sameSite: "Lax",
     path: "/",
   });
   return response;
