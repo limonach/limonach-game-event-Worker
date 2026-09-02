@@ -37,6 +37,15 @@ const MAX_REQUEST_BODY_BYTES = 10 * 1024; // 10 KB — this API doesn't need lar
 const WELCOME_BONUS_LIM = 10;
 
 // ---------------------------------------------------------------------
+// مكافأة الإعلان (RichAds) — لا يوجد تحقق من طرف الخادم (SSV) من مزوّد
+// الإعلانات، لذا هذه الأرقام هي الدفاع الوحيد ضد استدعاء هذه النقطة
+// مباشرة بدون مشاهدة إعلان فعلي. أبقِ القيمة منخفضة عمدًا.
+// ---------------------------------------------------------------------
+const AD_REWARD_LIM_AMOUNT = 1;
+const AD_REWARD_DAILY_CAP = 5;
+const AD_REWARD_COOLDOWN_MINUTES = 15;
+
+// ---------------------------------------------------------------------
 // جدول التوجيه — كل مسار: تعبير نمطي + طريقة HTTP + معالج + حد معدّل خاص به.
 // اختيار regex بدل switch بسيط لأن /tournaments/:id ديناميكي.
 // ---------------------------------------------------------------------
@@ -53,6 +62,7 @@ const ROUTES = [
   { name: "tournament_winners", method: "GET", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})\/winners$/, handler: handleTournamentWinners, rate: { limit: 60, windowSeconds: 60 } },
   { name: "wallet_transactions", method: "GET", pattern: /^\/wallet\/transactions$/, handler: handleWalletTransactions, rate: { limit: 60, windowSeconds: 60 } },
   { name: "my_tournaments", method: "GET", pattern: /^\/me\/tournaments$/, handler: handleMyTournaments, rate: { limit: 60, windowSeconds: 60 } },
+  { name: "watch_ad", method: "POST", pattern: /^\/rewards\/watch-ad$/, handler: handleWatchAd, rate: { limit: 10, windowSeconds: 60 } },
 ];
 
 // ---------------------------------------------------------------------
@@ -656,6 +666,85 @@ async function handleMyTournaments(request, env) {
   }));
 
   return jsonResponse({ success: true, entries }, 200);
+}
+
+// =====================================================================
+// POST /rewards/watch-ad — grants AD_REWARD_LIM_AMOUNT after a RichAds
+// rewarded interstitial resolves client-side.
+//
+// [مؤكد] SECURITY CAVEAT: RichAds (tg-ob.js) has no documented
+// server-side verification/postback. This handler CANNOT prove the ad
+// was actually watched — it only trusts the client's claim that
+// triggerInterstitialVideo() resolved. The daily cap + cooldown below
+// bound the damage (max AD_REWARD_DAILY_CAP * AD_REWARD_LIM_AMOUNT LIM
+// per account per day even if fully spoofed) but do not prevent
+// spoofing. Do not raise AD_REWARD_LIM_AMOUNT without re-evaluating
+// this trade-off.
+//
+// Balance increments go through the atomic credit_lim() SQL function
+// (see schema_ad_rewards.sql) to avoid lost-update races on the wallet
+// row itself. The daily-cap/cooldown *check* below is a separate,
+// non-atomic read — under rare simultaneous double-clicks a user could
+// squeeze in one extra reward beyond the cap. Given the reward is 1
+// LIM, that race is an accepted, low-value risk — NOT the same
+// trust model as join_tournament()'s money-critical atomicity.
+// =====================================================================
+async function handleWatchAd(request, env) {
+  const session = await resolveSession(request, env);
+  if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
+
+  const supabase = getSupabase(env);
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: recent, error: lookupError } = await supabase
+    .from("wallet_transactions")
+    .select("created_at")
+    .eq("user_id", session.user_id)
+    .eq("type", "ad_reward")
+    .gte("created_at", since24h)
+    .order("created_at", { ascending: false });
+
+  if (lookupError) {
+    console.error("ad_reward_lookup_failed");
+    return errorResponse("INTERNAL_ERROR", "Could not process reward.", 500);
+  }
+
+  if (recent && recent.length >= AD_REWARD_DAILY_CAP) {
+    return errorResponse("AD_DAILY_LIMIT_REACHED", "You've reached today's ad reward limit.", 429);
+  }
+
+  if (recent && recent.length > 0) {
+    const lastMs = new Date(recent[0].created_at).getTime();
+    const cooldownMs = AD_REWARD_COOLDOWN_MINUTES * 60 * 1000;
+    if (Date.now() - lastMs < cooldownMs) {
+      return errorResponse("AD_COOLDOWN", "Please wait before watching another ad.", 429);
+    }
+  }
+
+  const { data: newBalance, error: creditError } = await supabase.rpc("credit_lim", {
+    p_user_id: session.user_id,
+    p_amount: AD_REWARD_LIM_AMOUNT,
+  });
+
+  if (creditError) {
+    console.error("ad_reward_credit_failed", creditError.message);
+    return errorResponse("INTERNAL_ERROR", "Could not credit reward.", 500);
+  }
+
+  const { error: txError } = await supabase.from("wallet_transactions").insert({
+    user_id: session.user_id,
+    amount: AD_REWARD_LIM_AMOUNT,
+    type: "ad_reward",
+    currency: "LIM",
+  });
+  if (txError) {
+    // Balance is already credited at this point — log loudly but don't
+    // fail the response; the ledger row is for bookkeeping/rate-limit
+    // lookups, losing one entry doesn't corrupt the balance itself.
+    console.error("ad_reward_tx_log_failed", txError.message);
+  }
+
+  return jsonResponse({ success: true, balance: newBalance, reward: AD_REWARD_LIM_AMOUNT }, 200);
 }
 
 // =====================================================================
