@@ -45,6 +45,17 @@ const AD_REWARD_LIM_AMOUNT = 1;
 const AD_REWARD_DAILY_CAP = 5;
 const AD_REWARD_COOLDOWN_MINUTES = 15;
 
+// [تخمين] القيمة الحرفية لـ event التي ترسلها RichAds/uniqpaid عند اكتمال
+// مشاهدة الإعلان الفعلية (وليس click/impression فقط) غير مؤكدة — يجب
+// تأكيدها من جهة الاتصال في RichAds قبل الاعتماد عليها في الإنتاج. أي
+// قيمة أخرى لـ event تُستقبل وتُؤكَّد (200 OK) لكن لا تُمنح عنها مكافأة.
+const AD_POSTBACK_REWARD_EVENT_NAME = "reward";
+
+// أسرار جديدة مطلوبة لهذا الجزء (wrangler secret put):
+//   TELEGRAM_BOT_TOKEN       - توكن البوت من BotFather، للتحقق من HMAC لـ initData
+//   RICHADS_POSTBACK_SECRET  - سر عشوائي تولّده أنت وتُضمّنه في رابط الـ Postback
+//                              الذي تُرسله لجهة الاتصال في RichAds (وليس شيئًا يعطونه لك)
+
 // ---------------------------------------------------------------------
 // جدول التوجيه — كل مسار: تعبير نمطي + طريقة HTTP + معالج + حد معدّل خاص به.
 // اختيار regex بدل switch بسيط لأن /tournaments/:id ديناميكي.
@@ -62,7 +73,9 @@ const ROUTES = [
   { name: "tournament_winners", method: "GET", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})\/winners$/, handler: handleTournamentWinners, rate: { limit: 60, windowSeconds: 60 } },
   { name: "wallet_transactions", method: "GET", pattern: /^\/wallet\/transactions$/, handler: handleWalletTransactions, rate: { limit: 60, windowSeconds: 60 } },
   { name: "my_tournaments", method: "GET", pattern: /^\/me\/tournaments$/, handler: handleMyTournaments, rate: { limit: 60, windowSeconds: 60 } },
-  { name: "watch_ad", method: "POST", pattern: /^\/rewards\/watch-ad$/, handler: handleWatchAd, rate: { limit: 10, windowSeconds: 60 } },
+  { name: "telegram_link", method: "POST", pattern: /^\/auth\/telegram\/link$/, handler: handleTelegramLink, rate: { limit: 10, windowSeconds: 60 } },
+  // GET, لا جلسة — تُستدعى من خوادم RichAds/uniqpaid مباشرة، وليس من المتصفح.
+  { name: "ad_postback", method: "GET", pattern: /^\/rewards\/ad-postback$/, handler: handleAdPostback, rate: { limit: 120, windowSeconds: 60 } },
 ];
 
 // ---------------------------------------------------------------------
@@ -669,82 +682,196 @@ async function handleMyTournaments(request, env) {
 }
 
 // =====================================================================
-// POST /rewards/watch-ad — grants AD_REWARD_LIM_AMOUNT after a RichAds
-// rewarded interstitial resolves client-side.
+// POST /auth/telegram/link — links the CURRENT (Google-authenticated)
+// session's account to a Telegram numeric ID, verified via Telegram's
+// documented Mini App initData HMAC scheme (bot-token based — this is
+// NOT the OIDC/Login-Widget flow, much simpler, no Client Secret/
+// Redirect URIs involved). Needed so /rewards/ad-postback (which only
+// knows the Telegram ID, not our internal user id) can find the right
+// wallet to credit.
 //
-// [مؤكد] SECURITY CAVEAT: RichAds (tg-ob.js) has no documented
-// server-side verification/postback. This handler CANNOT prove the ad
-// was actually watched — it only trusts the client's claim that
-// triggerInterstitialVideo() resolved. The daily cap + cooldown below
-// bound the damage (max AD_REWARD_DAILY_CAP * AD_REWARD_LIM_AMOUNT LIM
-// per account per day even if fully spoofed) but do not prevent
-// spoofing. Do not raise AD_REWARD_LIM_AMOUNT without re-evaluating
-// this trade-off.
-//
-// Balance increments go through the atomic credit_lim() SQL function
-// (see schema_ad_rewards.sql) to avoid lost-update races on the wallet
-// row itself. The daily-cap/cooldown *check* below is a separate,
-// non-atomic read — under rare simultaneous double-clicks a user could
-// squeeze in one extra reward beyond the cap. Given the reward is 1
-// LIM, that race is an accepted, low-value risk — NOT the same
-// trust model as join_tournament()'s money-critical atomicity.
+// Safe to call on every Mini App page load — idempotent. Rejects if
+// this Telegram ID is already linked to a DIFFERENT account (prevents
+// one Telegram identity from being attached to multiple Google
+// accounts, which would otherwise let someone farm multiple welcome
+// bonuses / ad rewards under one real Telegram identity).
 // =====================================================================
-async function handleWatchAd(request, env) {
+async function handleTelegramLink(request, env) {
   const session = await resolveSession(request, env);
   if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
 
-  const supabase = getSupabase(env);
-  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    console.error("telegram_bot_token_missing");
+    return errorResponse("INTERNAL_ERROR", "Telegram linking is not configured.", 500);
+  }
 
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return errorResponse("INVALID_INPUT", "Request body must be valid JSON.", 400);
+  }
+
+  const initData = typeof body.init_data === "string" ? body.init_data : "";
+  if (!initData) return errorResponse("INVALID_INPUT", "Missing init_data.", 400);
+
+  let verified;
+  try {
+    verified = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN);
+  } catch (err) {
+    console.error("telegram_init_data_invalid", err && err.message);
+    return errorResponse("INVALID_TELEGRAM_DATA", "Could not verify Telegram data.", 401);
+  }
+
+  const telegramId = String(verified.user.id);
+  const supabase = getSupabase(env);
+
+  const { data: existing } = await supabase.from("users").select("id").eq("telegram_id", telegramId).maybeSingle();
+  if (existing && existing.id !== session.user_id) {
+    return errorResponse("TELEGRAM_ALREADY_LINKED", "This Telegram account is already linked to another user.", 409);
+  }
+
+  const { error } = await supabase.from("users").update({ telegram_id: telegramId }).eq("id", session.user_id);
+  if (error) {
+    console.error("telegram_link_failed", error.message);
+    return errorResponse("INTERNAL_ERROR", "Could not link Telegram account.", 500);
+  }
+
+  return jsonResponse({ success: true, telegram_id: telegramId }, 200);
+}
+
+// =====================================================================
+// GET /rewards/ad-postback — called SERVER-TO-SERVER by RichAds/
+// uniqpaid, NOT by the browser. No session cookie exists on this
+// request — auth is the `token` query param (RICHADS_POSTBACK_SECRET,
+// generated by us, embedded as a literal/non-macro part of the URL we
+// hand to our RichAds contact), plus `event` must match the confirmed
+// "fully watched" event name.
+//
+// [مؤكد] STILL UNCONFIRMED — do not treat as production-ready until
+// verified with the RichAds contact:
+//   - The exact literal value of `event` that means "reward earned"
+//     (AD_POSTBACK_REWARD_EVENT_NAME below is a guess: "reward").
+//   - Whether RichAds expects a specific response body/status to
+//     acknowledge the postback (currently returns plain "OK" / 200).
+//   - Whether they can restrict calls to a known IP range for a second
+//     layer of defense beyond the token.
+//
+// Always returns 200 (even on unknown telegram_id / cap reached) to
+// avoid the ad network retrying indefinitely — failures are logged
+// server-side instead, visible via `wrangler tail`.
+// =====================================================================
+async function handleAdPostback(request, env) {
+  const url = new URL(request.url);
+  const token = url.searchParams.get("token");
+
+  if (!env.RICHADS_POSTBACK_SECRET || token !== env.RICHADS_POSTBACK_SECRET) {
+    console.error("ad_postback_bad_token");
+    return new Response("forbidden", { status: 403 });
+  }
+
+  const telegramId = url.searchParams.get("user_id");
+  const event = url.searchParams.get("event");
+  if (!telegramId) return new Response("missing user_id", { status: 400 });
+
+  if (event !== AD_POSTBACK_REWARD_EVENT_NAME) {
+    // Non-reward event (e.g. click/impression) — acknowledge, no credit.
+    return new Response("OK", { status: 200 });
+  }
+
+  const supabase = getSupabase(env);
+  const { data: user } = await supabase.from("users").select("id").eq("telegram_id", telegramId).maybeSingle();
+  if (!user) {
+    console.error("ad_postback_unknown_telegram_id", telegramId);
+    return new Response("OK", { status: 200 });
+  }
+
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const { data: recent, error: lookupError } = await supabase
     .from("wallet_transactions")
     .select("created_at")
-    .eq("user_id", session.user_id)
+    .eq("user_id", user.id)
     .eq("type", "ad_reward")
     .gte("created_at", since24h)
     .order("created_at", { ascending: false });
 
   if (lookupError) {
-    console.error("ad_reward_lookup_failed");
-    return errorResponse("INTERNAL_ERROR", "Could not process reward.", 500);
+    console.error("ad_postback_lookup_failed");
+    return new Response("error", { status: 500 });
   }
 
   if (recent && recent.length >= AD_REWARD_DAILY_CAP) {
-    return errorResponse("AD_DAILY_LIMIT_REACHED", "You've reached today's ad reward limit.", 429);
+    return new Response("OK", { status: 200 }); // acknowledged, daily cap reached
   }
-
   if (recent && recent.length > 0) {
     const lastMs = new Date(recent[0].created_at).getTime();
-    const cooldownMs = AD_REWARD_COOLDOWN_MINUTES * 60 * 1000;
-    if (Date.now() - lastMs < cooldownMs) {
-      return errorResponse("AD_COOLDOWN", "Please wait before watching another ad.", 429);
+    if (Date.now() - lastMs < AD_REWARD_COOLDOWN_MINUTES * 60 * 1000) {
+      return new Response("OK", { status: 200 }); // acknowledged, cooldown active
     }
   }
 
   const { data: newBalance, error: creditError } = await supabase.rpc("credit_lim", {
-    p_user_id: session.user_id,
+    p_user_id: user.id,
     p_amount: AD_REWARD_LIM_AMOUNT,
   });
 
   if (creditError) {
-    console.error("ad_reward_credit_failed", creditError.message);
-    return errorResponse("INTERNAL_ERROR", "Could not credit reward.", 500);
+    console.error("ad_postback_credit_failed", creditError.message);
+    return new Response("error", { status: 500 });
   }
 
   const { error: txError } = await supabase.from("wallet_transactions").insert({
-    user_id: session.user_id,
+    user_id: user.id,
     amount: AD_REWARD_LIM_AMOUNT,
     type: "ad_reward",
     currency: "LIM",
   });
-  if (txError) {
-    // Balance is already credited at this point — log loudly but don't
-    // fail the response; the ledger row is for bookkeeping/rate-limit
-    // lookups, losing one entry doesn't corrupt the balance itself.
-    console.error("ad_reward_tx_log_failed", txError.message);
-  }
+  if (txError) console.error("ad_postback_tx_log_failed", txError.message);
 
-  return jsonResponse({ success: true, balance: newBalance, reward: AD_REWARD_LIM_AMOUNT }, 200);
+  console.log("ad_postback_credited", telegramId, newBalance);
+  return new Response("OK", { status: 200 });
+}
+
+// =====================================================================
+// Telegram Mini App initData verification (bot-token HMAC scheme —
+// see https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app).
+// Distinct from, and much simpler than, Telegram OIDC/Login Widget.
+// =====================================================================
+async function hmacSha256Bytes(keyBytes, message) {
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return new Uint8Array(sig);
+}
+
+async function verifyTelegramInitData(initData, botToken) {
+  const params = new URLSearchParams(initData);
+  const hash = params.get("hash");
+  if (!hash) throw new Error("missing_hash");
+  params.delete("hash");
+
+  const sortedKeys = Array.from(params.keys()).sort();
+  const dataCheckString = sortedKeys.map((key) => `${key}=${params.get(key)}`).join("\n");
+
+  // secret_key = HMAC_SHA256(key="WebAppData", message=bot_token)
+  const secretKeyBytes = await hmacSha256Bytes(new TextEncoder().encode("WebAppData"), botToken);
+  // computed_hash = HEX(HMAC_SHA256(key=secret_key, message=dataCheckString))
+  const computedBytes = await hmacSha256Bytes(secretKeyBytes, dataCheckString);
+  const computedHex = Array.from(computedBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  if (computedHex !== hash) throw new Error("bad_signature");
+
+  const authDate = Number(params.get("auth_date"));
+  const now = Math.floor(Date.now() / 1000);
+  if (!authDate || now - authDate > 86400) throw new Error("stale_init_data");
+
+  const userJson = params.get("user");
+  if (!userJson) throw new Error("missing_user");
+  const user = JSON.parse(userJson);
+  if (!user || !user.id) throw new Error("missing_user_id");
+
+  return { user, authDate };
 }
 
 // =====================================================================
