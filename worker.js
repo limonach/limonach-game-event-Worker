@@ -73,6 +73,7 @@ const ROUTES = [
   { name: "tournament_winners", method: "GET", pattern: /^\/tournaments\/([0-9a-fA-F-]{36})\/winners$/, handler: handleTournamentWinners, rate: { limit: 60, windowSeconds: 60 } },
   { name: "wallet_transactions", method: "GET", pattern: /^\/wallet\/transactions$/, handler: handleWalletTransactions, rate: { limit: 60, windowSeconds: 60 } },
   { name: "my_tournaments", method: "GET", pattern: /^\/me\/tournaments$/, handler: handleMyTournaments, rate: { limit: 60, windowSeconds: 60 } },
+  { name: "telegram_login", method: "POST", pattern: /^\/auth\/telegram\/login$/, handler: handleTelegramLogin, rate: { limit: 15, windowSeconds: 60 } },
   { name: "telegram_link", method: "POST", pattern: /^\/auth\/telegram\/link$/, handler: handleTelegramLink, rate: { limit: 10, windowSeconds: 60 } },
   // GET, لا جلسة — تُستدعى من خوادم RichAds/uniqpaid مباشرة، وليس من المتصفح.
   { name: "ad_postback", method: "GET", pattern: /^\/rewards\/ad-postback$/, handler: handleAdPostback, rate: { limit: 120, windowSeconds: 60 } },
@@ -696,6 +697,100 @@ async function handleMyTournaments(request, env) {
 // accounts, which would otherwise let someone farm multiple welcome
 // bonuses / ad rewards under one real Telegram identity).
 // =====================================================================
+// =====================================================================
+// POST /auth/telegram/login — PRIMARY login, no existing session
+// required. Verifies initData the same way as /auth/telegram/link, but
+// creates the account automatically if it doesn't exist yet (upsert on
+// telegram_id, exactly like the Google flow upserts on google_id), then
+// issues a normal session cookie — same trust model as Google login,
+// just with Telegram's HMAC signature standing in for Google's RS256
+// JWT. Zero redirects: this is a plain fetch() call from inside the
+// already-open Mini App, so the user never leaves Telegram.
+// =====================================================================
+async function handleTelegramLogin(request, env) {
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    console.error("telegram_bot_token_missing");
+    return errorResponse("INTERNAL_ERROR", "Telegram login is not configured.", 500);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return errorResponse("INVALID_INPUT", "Request body must be valid JSON.", 400);
+  }
+
+  const initData = typeof body.init_data === "string" ? body.init_data : "";
+  if (!initData) return errorResponse("INVALID_INPUT", "Missing init_data.", 400);
+
+  let verified;
+  try {
+    verified = await verifyTelegramInitData(initData, env.TELEGRAM_BOT_TOKEN);
+  } catch (err) {
+    console.error("telegram_init_data_invalid", err && err.message);
+    return errorResponse("INVALID_TELEGRAM_DATA", "Could not verify Telegram data.", 401);
+  }
+
+  const tgUser = verified.user;
+  const telegramId = String(tgUser.id);
+  const name = [tgUser.first_name, tgUser.last_name].filter(Boolean).join(" ") || tgUser.username || `tg_${telegramId}`;
+  const avatarUrl = tgUser.photo_url || null;
+  const nowIso = new Date().toISOString();
+
+  const supabase = getSupabase(env);
+
+  const { data: user, error: upsertError } = await supabase
+    .from("users")
+    .upsert(
+      { telegram_id: telegramId, name, avatar_url: avatarUrl, last_login_at: nowIso },
+      { onConflict: "telegram_id" }
+    )
+    .select("id, name, avatar_url, status")
+    .single();
+
+  if (upsertError || !user) {
+    console.error("telegram_login_upsert_failed", upsertError && upsertError.message);
+    return errorResponse("ACCOUNT_CONFLICT", "Could not create or find this Telegram account.", 409);
+  }
+
+  if (user.status !== "active") {
+    return errorResponse("ACCOUNT_DISABLED", "This account is not active.", 403);
+  }
+
+  // Same welcome-bonus wallet upsert as Google login — ignoreDuplicates
+  // means a returning user's balance is never touched here.
+  const { error: walletError } = await supabase
+    .from("wallets")
+    .upsert({ user_id: user.id, balance: WELCOME_BONUS_LIM }, { onConflict: "user_id", ignoreDuplicates: true });
+  if (walletError) console.error("telegram_login_wallet_upsert_failed");
+
+  const sessionDuration = Number(env.SESSION_DURATION_SECONDS) || DEFAULT_SESSION_DURATION_SECONDS;
+  const rawToken = randomHex(32);
+  const tokenHash = await sha256Hex(rawToken + env.SESSION_SECRET);
+  const expiresAtIso = new Date(Date.now() + sessionDuration * 1000).toISOString();
+
+  const { error: sessionError } = await supabase.from("sessions").insert({
+    user_id: user.id,
+    token_hash: tokenHash,
+    expires_at: expiresAtIso,
+    last_used_at: nowIso,
+  });
+  if (sessionError) {
+    console.error("telegram_login_session_insert_failed");
+    return errorResponse("LOGIN_FAILED", "Telegram sign-in failed. Please try again.", 502);
+  }
+
+  const response = jsonResponse({ success: true, user: { id: user.id, name: user.name, avatar_url: user.avatar_url } }, 200);
+  appendSetCookie(response.headers, "session", rawToken, {
+    maxAge: sessionDuration,
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax", // same-origin via the Pages proxy — see _worker.js
+    path: "/",
+  });
+  return response;
+}
+
 async function handleTelegramLink(request, env) {
   const session = await resolveSession(request, env);
   if (!session) return errorResponse("UNAUTHENTICATED", "Not signed in.", 401);
