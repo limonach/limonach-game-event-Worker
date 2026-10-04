@@ -1,0 +1,21 @@
+# ROBOT BATTLE ROYALE - Stage 1 - wrangler.toml
+# Put in the repo root next to worker.js. Used by Cloudflare "Workers Builds" (Git integration) - no CLI needed.
+# Secrets (JOIN_SECRET, ADMIN_KEY) are NOT here: add them in Dashboard -> Worker -> Settings -> Variables and Secrets.
+name = "limonach-game-event-worker"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+ALLOWED_ORIGIN = "https://limonach-game-event.pages.dev"
+
+[[durable_objects.bindings]]
+name = "MATCH"
+class_name = "MatchRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MatchRoom"]
+
+[[kv_namespaces]]
+binding = "RL"
+id = "90b4297ff1a64a919c35b3e0b60cbe5f"
