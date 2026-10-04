@@ -6,7 +6,9 @@ const C = {
   TICK_HZ: 20, SNAP_EVERY: 2,                 // TUNE: 20Hz sim, 10Hz snapshots
   MAX_PLAYERS: 52, START_HUMANS: 10, LOBBY_MS: 30000, // TUNE: start when 10 humans or 30s with >=1
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
-  R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 480, // TUNE: base range 480 so range boosts can reach the 600 cap
+  R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 480,
+  WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 480, n: 1, spread: 0 }, { dmg: 7, cd: 850, sp: 1200, rg: 320, n: 5, spread: 9 }, { dmg: 24, cd: 650, sp: 2400, rg: 560, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
+  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 380, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, // TUNE: bots were too aggressive; 6s spawn grace
   AUTO_RANGE: 450, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
   DC_GRACE_MS: 15000, MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
   ZONE_R0: 4000, ZONE_OFFSET: 300,
@@ -150,26 +152,27 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0 };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0 };
     this.players.set(p.id, p); return p;
   }
 
   genLoot() { // server-only loot: 0 scrap,1 part,2 chip,3 small shield,4 large shield,5 repair,6 crate
     this.loot = new Map(); this.lg = new Map(); this.nextL = 10000000; const R = this.R;
-    const roll = () => { const r = R(); return r < 0.45 ? 0 : r < 0.7 ? 1 : r < 0.8 ? 2 : r < 0.88 ? 3 : r < 0.92 ? 4 : r < 0.97 ? 5 : 6; };
-    for (const b of this.bl) for (let i = 0; i < C.LOOT_IN; i++) { const t = roll(); this.addLoot(t, b.x + 50 + R() * (b.w - 100), b.y + 50 + R() * (b.h - 100), t === 6 ? 40 + Math.floor(R() * 61) : 0); }
-    for (let i = 0; i < C.LOOT_OUT; i++) { const a = R() * 6.2832, d = Math.sqrt(R()) * 3700, x = 4000 + Math.cos(a) * d, y = 4000 + Math.sin(a) * d; if (blocked(this.bl, x, y, 14)) continue; const t = roll(); this.addLoot(t, x, y, t === 6 ? 40 + Math.floor(R() * 61) : 0); }
+    const roll = () => { const r = R(); return r < 0.4 ? 0 : r < 0.64 ? 1 : r < 0.72 ? 2 : r < 0.8 ? 3 : r < 0.84 ? 4 : r < 0.89 ? 5 : r < 0.94 ? 6 : r < 0.97 ? 7 : 8; };
+    const lv = (t) => t === 6 ? 40 + Math.floor(R() * 61) : t >= 7 ? (R() < 0.6 ? 0 : R() < 0.75 ? 1 : 2) : 0; // crate xp / weapon rarity
+    for (const b of this.bl) for (let i = 0; i < C.LOOT_IN; i++) { const t = roll(); this.addLoot(t, b.x + 50 + R() * (b.w - 100), b.y + 50 + R() * (b.h - 100), lv(t)); }
+    for (let i = 0; i < C.LOOT_OUT; i++) { const a = R() * 6.2832, d = Math.sqrt(R()) * 3700, x = 4000 + Math.cos(a) * d, y = 4000 + Math.sin(a) * d; if (blocked(this.bl, x, y, 14)) continue; const t = roll(); this.addLoot(t, x, y, lv(t)); }
   }
   addLoot(t, x, y, v) { const it = { id: this.nextL++, l: 1, t, x, y, v }; this.loot.set(it.id, it); const k = cell(x) * 100 + cell(y), a = this.lg.get(k); if (a) a.push(it); else this.lg.set(k, [it]); return it; }
   removeLoot(it) { this.loot.delete(it.id); const a = this.lg.get(cell(it.x) * 100 + cell(it.y)); if (a) { const i = a.indexOf(it); if (i >= 0) a.splice(i, 1); } }
   take(p, it) {
     const t = it.t;
-    if (t === 5 && p.hp >= p.maxHp) return; if ((t === 3 || t === 4) && p.shield >= p.maxSh) return;
+    if (t === 5 && p.hp >= p.maxHp) return; if ((t === 3 || t === 4) && p.shield >= p.maxSh) return; if (t >= 7 && p.w === t - 6 && p.wr >= it.v) return;
     if (t < 3) this.addXp(p, C.XP_ITEM[t]); else if (t === 3) p.shield = Math.min(p.maxSh, p.shield + 25); else if (t === 4) p.shield = Math.min(p.maxSh, p.shield + 50);
-    else if (t === 5) p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.4); else this.addXp(p, it.v);
+    else if (t === 5) p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.4); else if (t === 6) this.addXp(p, it.v); else { p.w = t - 6; p.wr = it.v; }
     it.gone = true; this.rm.push(it); // idempotent: gone flag blocks double pickup
   }
-  hurt(e, dm, by, now) { let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (e.hp <= 0 && !e.killer) e.killer = by; }
+  hurt(e, dm, by, now) { if (now < this.startAt + C.GRACE_MS) return; let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (e.hp <= 0 && !e.killer) e.killer = by; }
   addXp(p, n) {
     if (p.bot || n <= 0) return; p.xp += n | 0;
     while (p.lvl < 10 && p.xp >= C.XP_LV[p.lvl]) { p.lvl++; p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.2); p.lq++; }
@@ -265,15 +268,15 @@ export class MatchRoom {
 
   think(b, now) {
     const z = this.z; let en = null, best = 1e9;
-    this.q(this.gP, b.x, b.y, 600, (e) => { if (e === b) return; const d = Math.hypot(e.x - b.x, e.y - b.y); if (d < best) { best = d; en = e; } });
+    this.q(this.gP, b.x, b.y, C.BOT_RANGE, (e) => { if (e === b) return; const d = Math.hypot(e.x - b.x, e.y - b.y); if (d < best) { best = d; en = e; } });
     const out = Math.hypot(b.x - z.cx, b.y - z.cy) > z.r - 250 || Math.hypot(b.x - z.tcx, b.y - z.tcy) > z.tr - 250;
     b.fire = 0; let dx, dy;
     if (out) { dx = z.tcx - b.x; dy = z.tcy - b.y; }
     else if (en) {
       const ex = en.x - b.x, ey = en.y - b.y;
-      b.aim = nrm(Math.atan2(ey, ex) * 57.2958 + (Math.random() * 16 - 8));
-      b.fire = best < 520 && Math.random() < 0.7 ? 1 : 0;
-      if (best > 350) { dx = ex; dy = ey; } else { dx = -ey; dy = ex; }
+      b.aim = nrm(Math.atan2(ey, ex) * 57.2958 + (Math.random() * 2 - 1) * C.BOT_AIM_ERR);
+      b.fire = best < C.BOT_RANGE && Math.random() < C.BOT_FIRE_P ? 1 : 0;
+      if (best > 250) { dx = ex; dy = ey; } else { dx = -ey; dy = ex; }
     } else {
       if (!b.tx || Math.hypot(b.tx - b.x, b.ty - b.y) < 80 || Math.hypot(b.x - b.lx, b.y - b.ly) < 5) { b.tx = Math.max(100, Math.min(7900, b.x + (Math.random() - 0.5) * 1800)); b.ty = Math.max(100, Math.min(7900, b.y + (Math.random() - 0.5) * 1800)); }
       dx = b.tx - b.x; dy = b.ty - b.y;
@@ -326,21 +329,24 @@ export class MatchRoom {
         let tg = null, bd = 1e9;
         this.q(this.gP, p.x, p.y, C.AUTO_RANGE, (e) => { if (e === p) return; const d = Math.hypot(e.x - p.x, e.y - p.y); if (d < bd && d <= C.AUTO_RANGE) { bd = d; tg = e; } });
         if (now >= p.noiseAt) { p.noiseAt = now + 250; p.noise = (Math.random() * 2 - 1) * C.AUTO_ERR; }
-        if (tg) { p.aim = nrm(Math.atan2(tg.y - p.y, tg.x - p.x) * 57.2958 + p.noise); p.fire = 1; } else { p.aim = p.maim; p.fire = p.mfire; }
+        if (tg) { p.aim = nrm(Math.atan2(tg.y - p.y, tg.x - p.x) * 57.2958 + p.noise); p.fire = bd <= C.WEAPONS[p.w].rg ? 1 : p.mfire; } else { p.aim = p.maim; p.fire = p.mfire; }
       }
       if (p.b[6] && now - p.hitAt > 5000 && p.hp < p.maxHp) p.hp = Math.min(p.maxHp, p.hp + p.b[6] * dt);
       if (!p.bot) { const pr = C.PICK_R * (1 + 0.2 * p.b[7]); this.q(this.lg, p.x, p.y, pr, (it) => { if (!it.gone && Math.hypot(it.x - p.x, it.y - p.y) <= pr) this.take(p, it); }); } // server-side pickup range check
       let mx = p.mx, my = p.my; const m = Math.hypot(mx, my);
       if (m > 0) {
-        const f = Math.min(m, 100) / m, sp = C.SPEED * (1 + 0.1 * p.b[2]) * (Math.min(m, 100) / 100);
+        const f = Math.min(m, 100) / m, sp = C.SPEED * (1 + 0.1 * p.b[2]) * (p.bot ? C.BOT_SPEED : 1) * (Math.min(m, 100) / 100);
         const nx = p.x + (mx / m) * sp * dt, ny = p.y + (my / m) * sp * dt;
         if (!blocked(this.bl, nx, p.y, C.R)) p.x = nx;
         if (!blocked(this.bl, p.x, ny, C.R)) p.y = ny;
         p.x = Math.max(C.R, Math.min(C.WORLD - C.R, p.x)); p.y = Math.max(C.R, Math.min(C.WORLD - C.R, p.y));
       }
       if (p.fire && now >= p.cd) {
-        p.cd = now + C.COOLDOWN_MS / (1 + 0.15 * p.b[3]); const r = p.aim * 0.0174533, c = Math.cos(r), s = Math.sin(r);
-        this.bullets.push({ id: this.nextB++, b: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * C.BSPEED, vy: s * C.BSPEED, dist: 0, rg: Math.min(600, C.RANGE * (1 + 0.12 * p.b[5])) });
+        const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr]; p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
+        for (let n = 0; n < W0.n; n++) {
+          const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
+          this.bullets.push({ id: this.nextB++, b: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(600, W0.rg * (1 + 0.12 * p.b[5])) });
+        }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; }
     }
@@ -349,17 +355,17 @@ export class MatchRoom {
     const keep = [];
     for (const b of this.bullets) {
       let dead = false;
-      for (let s = 0; s < 3 && !dead; s++) {
-        b.x += (b.vx * dt) / 3; b.y += (b.vy * dt) / 3;
+      for (let s = 0; s < 4 && !dead; s++) {
+        b.x += (b.vx * dt) / 4; b.y += (b.vy * dt) / 4;
         if (b.x < 0 || b.y < 0 || b.x > C.WORLD || b.y > C.WORLD || blocked(this.bl, b.x, b.y, 0)) { dead = true; break; }
         this.q(this.gP, b.x, b.y, 30, (e) => {
           if (dead || e.id === b.o || !e.alive) return;
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
-            dead = true; const o = this.players.get(b.o), dm = C.DMG * (o ? 1 + 0.12 * o.b[0] : 1); if (o) o.dmg += dm; this.hurt(e, dm, b.o, now);
+            dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG : 1) : 1); if (o) o.dmg += dm; this.hurt(e, dm, b.o, now);
           }
         });
       }
-      b.dist += C.BSPEED * dt; if (b.dist >= b.rg) dead = true;
+      b.dist += b.sp * dt; if (b.dist >= b.rg) dead = true;
       if (!dead) keep.push(b);
     }
     this.bullets = keep;
@@ -381,12 +387,12 @@ export class MatchRoom {
         if (e === h || e.x < x0 || e.x > x1 || e.y < y0 || e.y > y1) continue;
         seen.add(e.id);
         if (e.b) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0]); } }
-        else if (e.l) { if (!known.has(e.id)) { known.set(e.id, 1); L.push([e.id, e.t, e.x | 0, e.y | 0]); } }
+        else if (e.l) { if (!known.has(e.id)) { known.set(e.id, 1); L.push([e.id, e.t, e.x | 0, e.y | 0, e.v | 0]); } }
         else { const s = (e.x | 0) + ',' + (e.y | 0) + ',' + e.aim + ',' + Math.ceil(e.hp); if (known.get(e.id) !== s) { known.set(e.id, s); P.push([e.id, e.x | 0, e.y | 0, e.aim, Math.ceil(e.hp)]); } }
       }
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [h.x | 0, h.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl], P, B, G, zArr, alive, el | 0, L]);
+    this.send(h.ws, [1, this.tickN, h.ack, [h.x | 0, h.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w * 3 + h.wr], P, B, G, zArr, alive, el | 0, L]);
   }
 
   finish(now, reason) {
