@@ -1,6 +1,6 @@
-// ROBOT BATTLE ROYALE - Stage 1 - worker.js
-// Role: API gateway Worker (/join, /ws, /stats) + MatchRoom Durable Object (one match, server-authoritative).
-// Paste/commit as worker.js (see wrangler.toml). Secrets: JOIN_SECRET, ADMIN_KEY. Var: ALLOWED_ORIGIN. KV: RL. DO: MATCH.
+// ROBOT BATTLE ROYALE - Stage 3 - worker.js
+// Role: API gateway (/auth /join /party/* /leave /stats /ws), Matchmaker DO (queues + parties), MatchRoom DO (one match per DO), Supabase writes at match end.
+// Commit as worker.js next to wrangler.toml. Secrets: JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN.
 
 const C = {
   TICK_HZ: 20, SNAP_EVERY: 2,                 // TUNE: 20Hz sim, 10Hz snapshots
@@ -19,53 +19,119 @@ const C = {
   PRICE_REQ_PER_M: 0.15, PRICE_GBS_PER_M: 12.5, DO_MEM_GB: 0.128 // TUNE: check current Cloudflare pricing
 };
 
+const K = { SESSION_MS: 4 * 3600 * 1000, TG_MAX_AGE_S: 86400, JOIN_MS: 30000, OPEN_MS: 35000, PARTY_MAX: 4, PARTY_TTL_MS: 1800000, TEAM: { solo: 1, duo: 2, squad: 4 }, RL: { auth: 20, join: 15, party: 40, stats: 30 } }; // TUNE
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const enc = new TextEncoder();
 const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
-const hkey = (secret, use) => crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [use]);
+const hkey = (secret, use) => crypto.subtle.importKey('raw', typeof secret === 'string' ? enc.encode(secret) : secret, { name: 'HMAC', hash: 'SHA-256' }, false, [use]);
 const sign = async (secret, data) => b64u(await crypto.subtle.sign('HMAC', await hkey(secret, 'sign'), enc.encode(data)));
 const verify = async (secret, data, sig) => { try { return await crypto.subtle.verify('HMAC', await hkey(secret, 'verify'), unb64u(sig), enc.encode(data)); } catch { return false; } };
 const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
 const J = (o, s, h) => new Response(JSON.stringify(o), { status: s || 200, headers: { 'content-type': 'application/json', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store', ...(h || {}) } });
+const reward = (place, kills) => 20 + kills * 15 + (place === 1 ? 150 : place <= 3 ? 75 : place <= 10 ? 30 : 0); // TUNE: soft currency per match (server-side only; SQL also caps it)
+
+// Signed tokens: base64url(json) + '.' + HMAC(domain + payload). Domains separate session tokens (S1.) from match-join tokens (J1.).
+async function mkTok(env, dom, obj) { const p = b64u(enc.encode(JSON.stringify(obj))); return p + '.' + (await sign(env.JOIN_SECRET, dom + p)); }
+async function rdTok(env, dom, t) {
+  if (typeof t !== 'string' || t.length > 700) return null; const a = t.split('.'); if (a.length !== 2 || !a[0] || !a[1]) return null;
+  if (!(await verify(env.JOIN_SECRET, dom + a[0], a[1]))) return null;
+  try { const o = JSON.parse(new TextDecoder().decode(unb64u(a[0]))); return o && o.exp > Date.now() ? o : null; } catch { return null; }
+}
+// Telegram Mini App initData check (HMAC-SHA256, per Telegram docs) + freshness window
+async function tgVerify(env, initData) {
+  if (typeof initData !== 'string' || !initData || initData.length > 4096 || !env.TELEGRAM_BOT_TOKEN) return null;
+  const sp = new URLSearchParams(initData), hash = sp.get('hash'); if (!hash || !/^[a-f0-9]{64}$/.test(hash)) return null; sp.delete('hash');
+  const dcs = [...sp.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([k, v]) => k + '=' + v).join('\n');
+  const sk = await crypto.subtle.sign('HMAC', await hkey('WebAppData', 'sign'), enc.encode(env.TELEGRAM_BOT_TOKEN));
+  const mac = [...new Uint8Array(await crypto.subtle.sign('HMAC', await hkey(sk, 'sign'), enc.encode(dcs)))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  if (!teq(mac, hash)) return null;
+  const ad = parseInt(sp.get('auth_date'), 10), now = Date.now() / 1000; if (!(ad > 0) || now - ad > K.TG_MAX_AGE_S || ad > now + 60) return null;
+  let u; try { u = JSON.parse(sp.get('user')); } catch { return null; }
+  if (!u || !Number.isSafeInteger(u.id) || u.id <= 0) return null;
+  return { id: u.id, name: String(u.first_name || 'Player').replace(/[^\p{L}\p{N} _-]/gu, '').trim().slice(0, 24) || 'Player' };
+}
+// Supabase REST via service key (secret only; never logged, never sent to clients)
+const sb = (env, path, init = {}) => {
+  const k = env.SUPABASE_SERVICE_ROLE_KEY, h = { apikey: k, 'Content-Type': 'application/json', ...(init.headers || {}) };
+  if (!k.startsWith('sb_')) h.Authorization = 'Bearer ' + k; // new-style sb_secret_ keys are sent as apikey only
+  return fetch(env.SUPABASE_URL + '/rest/v1/' + path, { ...init, headers: h });
+};
+async function rl(env, key, max) { // soft per-IP limit (KV is not atomic). Per-user atomic limits live in Matchmaker.
+  const k = 'rbr:rl:' + key + ':' + Math.floor(Date.now() / 60000), n = parseInt((await env.RL.get(k)) || '0', 10);
+  if (n >= max) return false; await env.RL.put(k, String(n + 1), { expirationTtl: 120 }); return true;
+}
+async function flushPending(env) { // retry end-of-match writes that failed (idempotent RPC)
+  const l = await env.RL.list({ prefix: 'rbr:pend:', limit: 20 });
+  for (const k of l.keys) { const v = await env.RL.get(k.name); if (!v) continue; try { const r = await sb(env, 'rpc/finish_match', { method: 'POST', body: v }); if (r.ok) await env.RL.delete(k.name); } catch {} }
+}
+const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
+const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
 
 export default {
+  async scheduled(event, env, ctx) { ctx.waitUntil(flushPending(env)); },
   async fetch(req, env) {
-    const url = new URL(req.url);
-    const origin = req.headers.get('Origin') || '';
-    const allowed = (env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
-    const okOrigin = allowed.includes(origin);
+    const url = new URL(req.url), origin = req.headers.get('Origin') || '';
+    const allowed = (env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean), okOrigin = allowed.includes(origin);
     const cors = okOrigin ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } : {};
+    const ip = req.headers.get('CF-Connecting-IP') || 'x', P = url.pathname;
     try {
-      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors, 'Access-Control-Allow-Methods': 'POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } });
-
-      if (url.pathname === '/join' && req.method === 'POST') {
-        if (!okOrigin) return J({ e: 'denied' }, 403);
-        const ip = req.headers.get('CF-Connecting-IP') || 'x';
-        const rk = 'rbr:rl:' + ip + ':' + Math.floor(Date.now() / 60000);
-        const n = parseInt((await env.RL.get(rk)) || '0', 10); // NOTE: KV is not atomic; soft limit only
-        if (n >= C.JOIN_PER_MIN) return J({ e: 'slow' }, 429, cors);
-        await env.RL.put(rk, String(n + 1), { expirationTtl: 120 });
-        let body; try { body = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
-        if (!body || typeof body.gid !== 'string' || !/^[a-f0-9]{16}$/.test(body.gid) || Object.keys(body).length !== 1) return J({ e: 'bad' }, 400, cors);
-        const data = body.gid + '.' + (Date.now() + C.TOKEN_TTL_MS) + '.' + hex(8);
-        return J({ t: data + '.' + (await sign(env.JOIN_SECRET, data)) }, 200, cors);
-      }
-
-      if (url.pathname === '/ws') {
-        if (!okOrigin) return new Response(null, { status: 403 });
-        if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
-        const p = (url.searchParams.get('t') || '').split('.');
-        if (p.length !== 4 || !/^[a-f0-9]{16}$/.test(p[0]) || !/^\d{10,14}$/.test(p[1]) || !/^[a-f0-9]{16}$/.test(p[2])) return new Response(null, { status: 400 });
-        if (+p[1] < Date.now()) return new Response(null, { status: 401 });
-        if (!(await verify(env.JOIN_SECRET, p.slice(0, 3).join('.'), p[3]))) return new Response(null, { status: 401 });
-        const r2 = new Request(req);
-        r2.headers.set('x-gid', p[0]); r2.headers.set('x-nonce', p[2]); r2.headers.set('x-exp', p[1]);
-        return env.MATCH.get(env.MATCH.idFromName('stage1')).fetch(r2);
-      }
-
-      if (url.pathname === '/stats') {
+      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors, 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,Authorization' } });
+      if (P === '/admin/stats') { // admin only: matchmaker + (optional) one match room
         if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
-        return env.MATCH.get(env.MATCH.idFromName('stage1')).fetch(new Request('https://do/stats'));
+        const m = url.searchParams.get('m'), out = { mm: await (await mmStub(env).fetch('https://mm/stats', { method: 'POST', body: '{}' })).json() };
+        if (m && UUID.test(m)) out.room = await (await env.MATCH.get(env.MATCH.idFromName(m)).fetch('https://do/stats')).json();
+        return J(out);
+      }
+      if (!okOrigin) return new Response(null, { status: 403 });
+
+      if (P === '/ws') {
+        if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
+        const t = await rdTok(env, 'J1.', url.searchParams.get('t'));
+        if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n)) return new Response(null, { status: 401 });
+        const r2 = new Request(req);
+        for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)]]) r2.headers.set(k, v);
+        return env.MATCH.get(env.MATCH.idFromName(t.m)).fetch(r2);
+      }
+
+      if (P === '/auth' && req.method === 'POST') {
+        if (!(await rl(env, 'auth:' + ip, K.RL.auth))) return J({ e: 'slow' }, 429, cors);
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'initData')) return J({ e: 'bad' }, 400, cors);
+        if (b.initData) {
+          const tg = await tgVerify(env, b.initData); if (!tg) return J({ e: 'auth' }, 401, cors);
+          const r = await sb(env, 'players?on_conflict=telegram_id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: JSON.stringify([{ telegram_id: tg.id, name: tg.name }]) });
+          const row = r.ok ? (await r.json())[0] : null; if (!row) { console.log('auth_db', r.status); return J({ e: 'err' }, 502, cors); }
+          if (row.banned) return J({ e: 'banned' }, 403, cors);
+          return J({ s: await mkTok(env, 'S1.', { u: 'p:' + row.id, pid: row.id, exp: Date.now() + K.SESSION_MS }), lvl: row.level, xp: row.total_xp, soft: row.soft_currency }, 200, cors);
+        }
+        if (env.ALLOW_GUEST !== '1') return J({ e: 'auth' }, 401, cors);
+        return J({ s: await mkTok(env, 'S1.', { u: 'g:' + hex(8), pid: null, exp: Date.now() + K.SESSION_MS }), guest: 1 }, 200, cors);
+      }
+
+      const ses = await rdTok(env, 'S1.', (req.headers.get('Authorization') || '').slice(7));
+      if (!ses || !/^[pg]:[0-9a-f-]{8,36}$/.test(ses.u)) return J({ e: 'auth' }, 401, cors);
+
+      if (P === '/stats' && req.method === 'GET') {
+        if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ guest: 1 }, 200, cors);
+        const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=level,total_xp,soft_currency,premium_currency');
+        const row = r.ok ? (await r.json())[0] : null; return row ? J(row, 200, cors) : J({ e: 'err' }, 502, cors);
+      }
+      if (P.startsWith('/party/') || P === '/leave' || P === '/join') {
+        if (!(await rl(env, (P === '/join' ? 'join:' : 'party:') + ip, P === '/join' ? K.RL.join : K.RL.party))) return J({ e: 'slow' }, 429, cors);
+        let b = {}; if (req.method === 'POST') { try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); } }
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'mode' && k !== 'code')) return J({ e: 'bad' }, 400, cors);
+        if (P === '/join') {
+          if (!K.TEAM[b.mode] || typeof b.mode !== 'string') return J({ e: 'bad' }, 400, cors);
+          if (ses.pid) { const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=banned'); const row = r.ok ? (await r.json())[0] : null; if (!row) return J({ e: 'err' }, 503, cors); if (row.banned) return J({ e: 'banned' }, 403, cors); } // fail closed
+          const [st, j] = await mmCall(env, '/join', { u: ses.u, md: b.mode });
+          if (st !== 200) return J({ e: j.e || 'err' }, st, cors);
+          const t = await mkTok(env, 'J1.', { u: ses.u, pid: ses.pid, m: j.m, md: j.md, pt: j.pt, exp: Date.now() + K.JOIN_MS, n: hex(8) });
+          return J({ t, md: j.md }, 200, cors);
+        }
+        const [st, j] = await mmCall(env, P, { u: ses.u, code: b.code });
+        return J(j, st, cors);
       }
       return new Response(null, { status: 404 });
     } catch (e) {
@@ -74,6 +140,77 @@ export default {
     }
   }
 };
+
+// ---------- Matchmaker Durable Object (singleton "mm") ----------
+// Why a DO and not KV: KV is eventually consistent and has no atomic ops, so two simultaneous joins can overfill a match or break
+// "one active match per user". A single-threaded DO serialises every decision. State is in memory: an eviction loses queues/parties
+// (players already inside a match are unaffected; they can simply queue again).
+export class Matchmaker {
+  constructor(state, env) { this.open = {}; this.um = new Map(); this.parties = new Map(); this.up = new Map(); this.last = new Map(); }
+  gc(now) {
+    for (const [c, p] of this.parties) if (!p.match && now - p.at > K.PARTY_TTL_MS) this.drop(c);
+    for (const [u, e] of this.um) if (now - e.t > 1200000) this.um.delete(u);
+    if (this.last.size > 2000) this.last.clear();
+  }
+  drop(c) { const p = this.parties.get(c); if (!p) return; for (const u of p.members) if (this.up.get(u) === c) this.up.delete(u); this.parties.delete(c); }
+  slot(md, n, now) {
+    let o = this.open[md];
+    if (!o || o.n + n > C.MAX_PLAYERS || now - o.since > K.OPEN_MS) o = this.open[md] = { m: crypto.randomUUID(), since: now, n: 0 };
+    o.n += n; return o.m;
+  }
+  async fetch(req) {
+    let b = {}; try { b = await req.json(); } catch {}
+    const P = new URL(req.url).pathname, now = Date.now(); this.gc(now);
+    if (P === '/stats') return J({ open: Object.keys(this.open).length, active: this.um.size, parties: this.parties.size });
+    if (P === '/started') { if (K.TEAM[b.md] && this.open[b.md] && this.open[b.md].m === b.m) delete this.open[b.md]; return J({ ok: 1 }); }
+    if (P === '/ended') {
+      if (!UUID.test(b.m) || !Array.isArray(b.us) || b.us.length > 60) return J({ e: 'bad' }, 400);
+      for (const x of b.us) { const e = this.um.get(x); if (e && e.m === b.m) this.um.delete(x); }
+      for (const p of this.parties.values()) if (p.match && p.match.m === b.m) delete p.match;
+      return J({ ok: 1 });
+    }
+    const u = typeof b.u === 'string' && /^[pg]:[0-9a-f-]{8,36}$/.test(b.u) ? b.u : null; if (!u) return J({ e: 'bad' }, 400);
+    const lk = P + u; if (now - (this.last.get(lk) || 0) < (P === '/join' ? 1500 : 800)) return J({ e: 'slow' }, 429); this.last.set(lk, now);
+    const code = this.up.get(u), pa = code && this.parties.get(code);
+    if (P === '/join') {
+      const md = b.md, cur = this.um.get(u);
+      if (!K.TEAM[md]) return J({ e: 'bad' }, 400);
+      if (cur) return J({ m: cur.m, md: cur.md, pt: cur.pt }); // one active match per user: re-issue a token for the same match
+      if (pa) {
+        if (!pa.match) {
+          if (pa.leader !== u) return J({ e: 'leader' }, 409);
+          pa.match = { m: this.slot(md, pa.members.size, now), md };
+        }
+        this.um.set(u, { m: pa.match.m, md: pa.match.md, pt: code, t: now });
+        return J({ m: pa.match.m, md: pa.match.md, pt: code });
+      }
+      const m = this.slot(md, 1, now); this.um.set(u, { m, md, pt: '', t: now }); return J({ m, md, pt: '' });
+    }
+    if (P === '/leave') {
+      const cur = this.um.get(u);
+      if (cur) { const o = this.open[cur.md]; if (o && o.m === cur.m && o.n > 0) o.n--; this.um.delete(u); }
+      if (pa) { if (pa.leader === u) this.drop(code); else { pa.members.delete(u); this.up.delete(u); } }
+      return J({ ok: 1 });
+    }
+    if (P === '/party/create') {
+      if (code) return J({ code });
+      const A = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; let c;
+      do { c = [...crypto.getRandomValues(new Uint8Array(6))].map((x) => A[x % A.length]).join(''); } while (this.parties.has(c));
+      this.parties.set(c, { leader: u, members: new Set([u]), at: now }); this.up.set(u, c); return J({ code: c });
+    }
+    if (P === '/party/join') {
+      const c = typeof b.code === 'string' && /^[A-Z2-9]{6}$/.test(b.code) ? b.code : null, p = c && this.parties.get(c);
+      if (!p || p.match || (p.members.size >= K.PARTY_MAX && !p.members.has(u)) || (code && code !== c)) return J({ e: 'nope' }, 404); // one generic error: no code oracle
+      p.members.add(u); this.up.set(u, c); return J({ code: c });
+    }
+    if (P === '/party/leave') {
+      if (pa) { if (pa.leader === u) this.drop(code); else { pa.members.delete(u); this.up.delete(u); } }
+      return J({ ok: 1 });
+    }
+    if (P === '/party/status') return J(pa ? { code, leader: pa.leader === u, n: pa.members.size, matched: !!pa.match } : { code: null });
+    return J({ e: 'bad' }, 404);
+  }
+}
 
 // ---------- helpers ----------
 function rng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
@@ -91,14 +228,14 @@ const nrm = (d) => ((Math.round(d) % 360) + 360) % 360;
 
 // ---------- Durable Object ----------
 export class MatchRoom {
-  constructor(state, env) { this.env = env; this.nonces = new Map(); this.banned = new Set(); this.timer = null; this.msgsIn = 0; this.reset(); }
+  constructor(state, env) { this.state = state; this.mode = ''; this.mid = ''; this.closed = false; this.env = env; this.nonces = new Map(); this.banned = new Set(); this.timer = null; this.msgsIn = 0; this.reset(); }
 
   reset() {
     this.state = 'lobby'; this.seed = (Math.random() * 4294967296) >>> 0; this.R = rng(this.seed);
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.lastPh = 0; this.lastTk = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
+    this.lastPh = 0; this.lastTk = 0; this.tl = []; this.teams = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
   }
 
   genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
@@ -164,7 +301,7 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0 };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0 };
     this.players.set(p.id, p); return p;
   }
 
@@ -210,21 +347,23 @@ export class MatchRoom {
     const u = new URL(req.url);
     if (u.pathname === '/stats') return J(this.stats());
     if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
-    const gid = req.headers.get('x-gid'), nonce = req.headers.get('x-nonce'), exp = +req.headers.get('x-exp');
-    if (!gid || !nonce || this.nonces.has(nonce)) return new Response(null, { status: 403 }); // replay protection
+    const gid = req.headers.get('x-u'), nonce = req.headers.get('x-nonce'), exp = +req.headers.get('x-exp'), md = req.headers.get('x-md'), mid = req.headers.get('x-m'), pid = req.headers.get('x-pid') || null, pt = req.headers.get('x-pt') || '';
+    if (!gid || !nonce || !mid || !K.TEAM[md] || this.nonces.has(nonce) || this.closed) return new Response(null, { status: 403 }); // replay protection
+    if (this.mid && this.mid !== mid) return new Response(null, { status: 403 });
+    if (!this.mid) { this.mid = mid; this.mode = md; }
     const now = Date.now(); this.nonces.set(nonce, exp);
     for (const [k, v] of this.nonces) if (v < now) this.nonces.delete(k);
     const pair = new WebSocketPair(); const [cl, sv] = Object.values(pair);
-    sv.accept(); this.onOpen(sv, gid);
+    sv.accept(); this.onOpen(sv, gid, pid, pt);
     return new Response(null, { status: 101, webSocket: cl });
   }
 
-  onOpen(ws, gid) {
+  onOpen(ws, gid, pid, pt) {
     const now = Date.now(); ws._t0 = now; ws._win = 0; ws._cnt = 0;
     if (this.banned.has(gid)) { try { ws.close(1008, 'policy'); } catch {} return; }
     let p = this.byGid.get(gid);
     if (p && !p.bot) { if (p.ws && p.ws !== ws) { try { p.ws.close(1000, 'dup'); } catch {} } p.ws = ws; p.dcAt = 0; }
-    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
+    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
     else { this.send(ws, [3, 'busy']); try { ws.close(1000, 'busy'); } catch {} return; }
     ws._p = p;
     this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV, this.ob.map((o) => [o.x, o.y, o.r, o.t, o.v])]);
@@ -274,13 +413,24 @@ export class MatchRoom {
   startMatch(now) {
     const fill = C.MAX_PLAYERS - this.players.size;
     for (let i = 0; i < fill; i++) this.mk(true, null, null);
+    // teams: party members together first, solo humans fill free slots, bots fill the rest (duo = 2, squad = 4, solo = 1)
+    const T = K.TEAM[this.mode] || 1, all = [...this.players.values()], hum = all.filter((p) => !p.bot), teams = [], parties = new Map();
+    const place = (p) => { let t = teams.find((x) => x.length < T); if (!t) { t = []; teams.push(t); } t.push(p); };
+    for (const p of hum) if (p.party) { if (!parties.has(p.party)) parties.set(p.party, []); parties.get(p.party).push(p); }
+    for (const g of parties.values()) { let t = null; for (const p of g) { if (!t || t.length >= T) { t = []; teams.push(t); } t.push(p); } }
+    for (const p of hum) if (!p.party) place(p);
+    for (const p of all) if (p.bot) place(p);
+    teams.forEach((t, i) => t.forEach((p) => { p.team = i + 1; }));
+    for (const t of teams) for (let i = 1; i < t.length; i++) for (let n = 0; n < 20; n++) { const x = t[0].x + (Math.random() - 0.5) * 300, y = t[0].y + (Math.random() - 0.5) * 300; if (x > 50 && y > 50 && x < 7950 && y < 7950 && !this.hit(x, y, C.R + 10)) { t[i].x = x; t[i].y = y; break; } }
+    this.tl = teams; this.teams = teams.length;
+    this.mm('/started', { m: this.mid, md: this.mode });
     this.state = 'running'; this.startAt = now; this.msgsMatch = 0;
     console.log(JSON.stringify({ ev: 'start', seed: this.seed, humans: this.humans(), bots: fill }));
   }
 
   think(b, now) {
     const z = this.z; let en = null, best = 1e9;
-    this.q(this.gP, b.x, b.y, C.BOT_RANGE, (e) => { if (e === b) return; const d = Math.hypot(e.x - b.x, e.y - b.y); if (d < best) { best = d; en = e; } });
+    this.q(this.gP, b.x, b.y, C.BOT_RANGE, (e) => { if (e === b || e.team === b.team) return; const d = Math.hypot(e.x - b.x, e.y - b.y); if (d < best) { best = d; en = e; } });
     const out = Math.hypot(b.x - z.cx, b.y - z.cy) > z.r - 250 || Math.hypot(b.x - z.tcx, b.y - z.tcy) > z.tr - 250;
     b.fire = 0; let dx, dy;
     if (out) { dx = z.tcx - b.x; dy = z.tcy - b.y; }
@@ -301,8 +451,9 @@ export class MatchRoom {
   kill(p, now) {
     if (!p.alive) return;
     p.alive = false; p.hp = 0; p.fire = 0; p.mx = 0; p.my = 0;
-    let alive = 0; for (const o of this.players.values()) if (o.alive) alive++;
-    p.place = alive + 1;
+    p.dieAt = now; const at = new Set(); for (const o of this.players.values()) if (o.alive) at.add(o.team);
+    p.place = at.size + 1; // team placement: set for the whole team once its last member dies
+    if (!at.has(p.team)) for (const o of this.players.values()) if (o.team === p.team) o.place = at.size + 1;
     const k = this.players.get(p.killer); if (k && k !== p) {
       k.kills++;
       if (!k.bot) { let xp; if (p.bot) xp = C.BOT_KILL_XP; else { xp = 80 + 25 * p.lvl; if (k.lvl - p.lvl >= 3) xp *= 0.6; else if (p.lvl - k.lvl >= 2) xp *= 1.5; } this.addXp(k, Math.round(xp)); }
@@ -311,7 +462,7 @@ export class MatchRoom {
     { // assist: >=25% of victim max HP dealt by someone else within the last 5s -> 40% of base kill XP
       const kx = p.bot ? C.BOT_KILL_XP : 80 + 25 * p.lvl, tot = new Map();
       for (const x of p.dl) if (now - x.t <= 5000) tot.set(x.by, (tot.get(x.by) || 0) + x.d);
-      for (const [id, d] of tot) { const a = this.players.get(id); if (a && a !== k && a !== p && d >= 0.25 * p.maxHp) this.addXp(a, Math.round(0.4 * kx)); }
+      for (const [id, d] of tot) { const a = this.players.get(id); if (a && a !== k && a !== p && d >= 0.25 * p.maxHp) { this.addXp(a, Math.round(0.4 * kx)); a.assists = (a.assists || 0) + 1; } }
     }
     this.send(p.ws, [2, p.place, p.kills]);
   }
@@ -329,7 +480,7 @@ export class MatchRoom {
       return;
     }
     if (this.state === 'ended') {
-      if (now - this.endAt > 5000) { for (const p of this.players.values()) { try { p.ws && p.ws.close(1000, 'end'); } catch {} } this.reset(); }
+      if (now - this.endAt > 5000) { for (const p of this.players.values()) { try { p.ws && p.ws.close(1000, 'end'); } catch {} } this.closed = true; if (this.timer) { clearInterval(this.timer); this.timer = null; } } // one DO per match: no reuse after the end
       return;
     }
     // running
@@ -344,7 +495,7 @@ export class MatchRoom {
       if (p.bot && now >= p.thinkAt) { p.thinkAt = now + 200; this.think(p, now); }
       if (!p.bot && p.auto) { // server-side auto-aim/auto-fire: nearest visible enemy in AUTO_RANGE, same rules for everyone
         let tg = null, bd = 1e9;
-        this.q(this.gP, p.x, p.y, C.AUTO_RANGE, (e) => { if (e === p) return; const d = Math.hypot(e.x - p.x, e.y - p.y); if (d < bd && d <= C.AUTO_RANGE) { bd = d; tg = e; } });
+        this.q(this.gP, p.x, p.y, C.AUTO_RANGE, (e) => { if (e === p || e.team === p.team) return; const d = Math.hypot(e.x - p.x, e.y - p.y); if (d < bd && d <= C.AUTO_RANGE) { bd = d; tg = e; } });
         if (now >= p.noiseAt) { p.noiseAt = now + 250; p.noise = (Math.random() * 2 - 1) * C.AUTO_ERR; }
         if (tg) { p.aim = nrm(Math.atan2(tg.y - p.y, tg.x - p.x) * 57.2958 + p.noise); p.fire = bd <= C.WEAPONS[p.w].rg ? 1 : p.mfire; } else { p.aim = p.maim; p.fire = p.mfire; }
       }
@@ -362,7 +513,7 @@ export class MatchRoom {
         const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr]; p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
         for (let n = 0; n < W0.n; n++) {
           const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
-          this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
+          this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
         }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; }
@@ -376,7 +527,7 @@ export class MatchRoom {
         b.x += (b.vx * dt) / 4; b.y += (b.vy * dt) / 4;
         if (b.x < 0 || b.y < 0 || b.x > C.WORLD || b.y > C.WORLD || this.hit(b.x, b.y, 0)) { dead = true; break; }
         this.q(this.gP, b.x, b.y, 30, (e) => {
-          if (dead || e.id === b.o || !e.alive) return;
+          if (dead || e.id === b.o || !e.alive || e.team === b.tm) return; // friendly fire off
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
             dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG : 1) : 1); if (o) o.dmg += dm; this.hurt(e, dm, b.o, now);
           }
@@ -387,8 +538,8 @@ export class MatchRoom {
     }
     this.bullets = keep;
     for (const p of this.players.values()) if (p.alive && p.hp <= 0) this.kill(p, now);
-    let alive = 0, last = null; for (const p of this.players.values()) if (p.alive) { alive++; last = p; }
-    if (alive <= 1 || el > C.HARD_CAP_S + 15) { if (last) { last.place = 1; } this.finish(now, alive <= 1 ? 'last' : 'cap'); return; }
+    let alive = 0; const ta = new Set(); for (const p of this.players.values()) if (p.alive) { alive++; ta.add(p.team); }
+    if (ta.size <= 1 || el > C.HARD_CAP_S + 15) { for (const p of this.players.values()) if (p.alive) p.place = 1; this.finish(now, ta.size <= 1 ? 'last' : 'cap'); return; }
     if (this.tickN % C.SNAP_EVERY === 0) {
       const gAll = this.grid(true), zArr = [z.cx | 0, z.cy | 0, z.r | 0, z.tcx | 0, z.tcy | 0, z.tr | 0, Math.ceil(z.left), z.ph, z.dps, z.shrink];
       for (const h of this.players.values()) if (!h.bot && h.ws) this.snap(h, gAll, zArr, alive, el);
@@ -409,7 +560,7 @@ export class MatchRoom {
       }
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [h.x | 0, h.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w * 3 + h.wr], P, B, G, zArr, alive, el | 0, L]);
+    this.send(h.ws, [1, this.tickN, h.ack, [h.x | 0, h.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w * 3 + h.wr], P, B, G, zArr, alive, el | 0, L, this.tm(h)]);
   }
 
   finish(now, reason) {
@@ -418,7 +569,26 @@ export class MatchRoom {
     for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg)]); }
     for (const p of this.players.values()) if (p.ws) p.ws._t0 = now;
     console.log(JSON.stringify({ ev: 'end', reason, ...s, suspicious: this.susp.length }));
-    // Stage 3: batch-write match + match_players + suspicion_logs to Supabase here (one write, via service key secret).
+    const hum = [...this.players.values()].filter((p) => !p.bot);
+    this.mm('/ended', { m: this.mid, us: hum.map((p) => p.gid) });
+    this.persist(now, hum).catch((e) => console.log('persist_fatal', String(e && e.message)));
+  }
+
+  mm(path, body) { try { return this.env.MM.get(this.env.MM.idFromName('mm')).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }).catch(() => {}); } catch {} }
+  tm(h) { const o = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h) o.push([m.id, m.x | 0, m.y | 0, m.alive ? 1 : 0]); return o; } // teammates only (minimap + markers)
+  async persist(now, hum) { // ONE atomic, idempotent RPC at match end (zero writes during the match)
+    const byId = new Map(hum.map((p) => [p.id, p]));
+    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills) }));
+    if (!mp.length) return; // guests are never persisted
+    const agg = new Map(); for (const s of this.susp) { const p = byId.get(s.p); if (p && p.pid) { const k = p.pid + '|' + s.k; agg.set(k, (agg.get(k) || 0) + 1); } }
+    const sl = [...agg].slice(0, 200).map(([k, n]) => { const [pid, kind] = k.split('|'); return { player_id: pid, kind, detail: { count: n } }; });
+    const iso = (t) => new Date(t).toISOString();
+    const body = JSON.stringify({ p: { m: { id: this.mid, mode: this.mode, seed: this.seed, started_at: iso(this.startAt), ended_at: iso(now), humans: hum.length, bots: this.players.size - hum.length, duration_s: Math.round((now - this.startAt) / 1000) }, mp, sl } });
+    for (let i = 0; i < 3; i++) {
+      try { const r = await sb(this.env, 'rpc/finish_match', { method: 'POST', body }); if (r.ok) return; console.log('persist_http', r.status); } catch (e) { console.log('persist_err', String(e && e.message)); }
+      await new Promise((r) => setTimeout(r, 500 * 2 ** i));
+    }
+    try { await this.env.RL.put('rbr:pend:' + this.mid, body, { expirationTtl: 604800 }); } catch {} // cron flushes it later
   }
 
   stats() {
@@ -426,6 +596,6 @@ export class MatchRoom {
     const reqs = this.msgsMatch / 20 + this.humans();
     const gbs = C.DO_MEM_GB * secs;
     const cost = (reqs * C.PRICE_REQ_PER_M) / 1e6 + (gbs * C.PRICE_GBS_PER_M) / 1e6;
-    return { state: this.state, humans: this.humans(), players: this.players.size, msgsInMatch: this.msgsMatch, msgsInTotal: this.msgsIn, matchSecs: Math.round(secs), billedReqEst: Math.round(reqs), socketSecs: Math.round(this.sockMs / 1000), costUsdEst: +cost.toFixed(5) };
+    return { mid: this.mid, mode: this.mode, teams: this.teams, state: this.state, humans: this.humans(), players: this.players.size, msgsInMatch: this.msgsMatch, msgsInTotal: this.msgsIn, matchSecs: Math.round(secs), billedReqEst: Math.round(reqs), socketSecs: Math.round(this.sockMs / 1000), costUsdEst: +cost.toFixed(5) };
   }
 }

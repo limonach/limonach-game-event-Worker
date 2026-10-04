@@ -1,21 +1,33 @@
-# ROBOT BATTLE ROYALE - Stage 1 - wrangler.toml
-# Put in the repo root next to worker.js. Used by Cloudflare "Workers Builds" (Git integration) - no CLI needed.
-# Secrets (JOIN_SECRET, ADMIN_KEY) are NOT here: add them in Dashboard -> Worker -> Settings -> Variables and Secrets.
+# ROBOT BATTLE ROYALE - Stage 3 - wrangler.toml (repo root, next to worker.js; used by Workers Builds / Git deploy)
+# Secrets (NOT here): JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN
 name = "limonach-game-event-worker"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
 [vars]
 ALLOWED_ORIGIN = "https://limonach-game-event.pages.dev"
+SUPABASE_URL = "https://pktulmzlxgrqqmlgwzfh.supabase.co"
+ALLOW_GUEST = "1"   # TUNE: "1" lets non-Telegram browsers play as guests (nothing saved). Set "0" for production.
 
 [[durable_objects.bindings]]
 name = "MATCH"
 class_name = "MatchRoom"
 
+[[durable_objects.bindings]]
+name = "MM"
+class_name = "Matchmaker"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MatchRoom"]
 
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Matchmaker"]
+
 [[kv_namespaces]]
 binding = "RL"
 id = "90b4297ff1a64a919c35b3e0b60cbe5f"
+
+[triggers]
+crons = ["*/10 * * * *"]   # retries any end-of-match write that failed
