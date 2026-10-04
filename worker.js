@@ -6,14 +6,14 @@ const C = {
   TICK_HZ: 20, SNAP_EVERY: 2,                 // TUNE: 20Hz sim, 10Hz snapshots
   MAX_PLAYERS: 52, START_HUMANS: 10, LOBBY_MS: 30000, // TUNE: start when 10 humans or 30s with >=1
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
-  R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 480,
-  WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 480, n: 1, spread: 0 }, { dmg: 7, cd: 850, sp: 1200, rg: 320, n: 5, spread: 9 }, { dmg: 24, cd: 650, sp: 2400, rg: 560, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
-  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 380, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, // TUNE: bots were too aggressive; 6s spawn grace
-  AUTO_RANGE: 450, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
+  R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 240, MAX_RANGE: 300, // TUNE: reach = range+58 must stay < 360 (half of 720 view height)
+  WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spread: 0 }, { dmg: 7, cd: 850, sp: 1200, rg: 170, n: 5, spread: 9 }, { dmg: 24, cd: 650, sp: 2400, rg: 300, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
+  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, // TUNE: bots were too aggressive; 6s spawn grace
+  AUTO_RANGE: 280, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
   DC_GRACE_MS: 15000, MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
   ZONE_R0: 4000, ZONE_OFFSET: 300,
   PHASES: [[120, 45, 2800, 2], [60, 40, 1800, 4], [50, 35, 1000, 8], [40, 30, 450, 14], [30, 25, 0, 22]], // wait,shrink,endR,dps
-  BUILDINGS: 56, LOOT_IN: 4, LOOT_OUT: 160, PICK_R: 60, SHIELD_BASE: 50, PHASE_XP: 15, BOT_KILL_XP: 30, // TUNE
+  BUILDINGS: 56, ROCKS: 160, TREES: 240, LOOT_IN: 4, LOOT_OUT: 160, PICK_R: 60, SHIELD_BASE: 50, PHASE_XP: 15, BOT_KILL_XP: 30, // TUNE
   XP_LV: [0, 100, 250, 450, 700, 1000, 1400, 1900, 2500, 3200], XP_ITEM: [10, 25, 60],
   TOKEN_TTL_MS: 30000, JOIN_PER_MIN: 10,
   PRICE_REQ_PER_M: 0.15, PRICE_GBS_PER_M: 12.5, DO_MEM_GB: 0.128 // TUNE: check current Cloudflare pricing
@@ -114,6 +114,18 @@ export class MatchRoom {
     this.bl = bl; this.rh = []; this.rv = [];
     for (let i = 0; i < 4; i++) { this.rh.push(Math.round(1000 + i * 2000 + (R() - 0.5) * 600)); this.rv.push(Math.round(1000 + i * 2000 + (R() - 0.5) * 600)); }
     this.dist = []; for (let i = 0; i < 16; i++) this.dist.push(Math.floor(R() * 3));
+    this.ob = []; const nearRoad = (x, y) => this.rh.some((v) => Math.abs(y - v) < 120) || this.rv.some((v) => Math.abs(x - v) < 120);
+    for (let tries = 0; tries < 4000 && this.ob.length < C.ROCKS + C.TREES; tries++) { // rocks first, then trees; trees collide only with the trunk
+      const x = Math.round(150 + R() * 7700), y = Math.round(150 + R() * 7700), tree = this.ob.length >= C.ROCKS ? 1 : 0, r = tree ? 55 + Math.floor(R() * 26) : 22 + Math.floor(R() * 21), v = Math.floor(R() * 63);
+      if (nearRoad(x, y) || bl.some((b) => x > b.x - 80 && x < b.x + b.w + 80 && y > b.y - 80 && y < b.y + b.h + 80)) continue;
+      this.ob.push({ x, y, r, t: tree, v });
+    }
+    this.col = bl.concat(this.ob.map((o) => { const h = o.t ? 14 : o.r * 0.85, q = { x: o.x - h, y: o.y - h, w: 2 * h, h: 2 * h }; return { ...q, walls: [q] }; }));
+    this.cg = new Map(); for (const b of this.col) for (let cx = cell(b.x); cx <= cell(b.x + b.w); cx++) for (let cy = cell(b.y); cy <= cell(b.y + b.h); cy++) { const k = cx * 100 + cy, a = this.cg.get(k); if (a) a.push(b); else this.cg.set(k, [b]); }
+  }
+  hit(x, y, r) { // circle vs buildings+obstacles through the 200u grid
+    for (let cx = cell(x - r); cx <= cell(x + r); cx++) for (let cy = cell(y - r); cy <= cell(y + r); cy++) { const a = this.cg.get(cx * 100 + cy); if (!a) continue; for (const b of a) { if (x < b.x - r || x > b.x + b.w + r || y < b.y - r || y > b.y + b.h + r) continue; for (const w of b.walls) if (circRect(w, x, y, r)) return true; } }
+    return false;
   }
 
   genZone() {
@@ -145,14 +157,14 @@ export class MatchRoom {
     for (let i = 0; i < 100; i++) {
       const a = Math.random() * 6.2832, d = Math.sqrt(Math.random()) * 3500;
       const x = 4000 + Math.cos(a) * d, y = 4000 + Math.sin(a) * d;
-      if (!blocked(this.bl, x, y, C.R + 10)) return [x, y];
+      if (!this.hit(x, y, C.R + 10)) return [x, y];
     }
     return [4000, 4000];
   }
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0 };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0 };
     this.players.set(p.id, p); return p;
   }
 
@@ -161,7 +173,7 @@ export class MatchRoom {
     const roll = () => { const r = R(); return r < 0.4 ? 0 : r < 0.64 ? 1 : r < 0.72 ? 2 : r < 0.8 ? 3 : r < 0.84 ? 4 : r < 0.89 ? 5 : r < 0.94 ? 6 : r < 0.97 ? 7 : 8; };
     const lv = (t) => t === 6 ? 40 + Math.floor(R() * 61) : t >= 7 ? (R() < 0.6 ? 0 : R() < 0.75 ? 1 : 2) : 0; // crate xp / weapon rarity
     for (const b of this.bl) for (let i = 0; i < C.LOOT_IN; i++) { const t = roll(); this.addLoot(t, b.x + 50 + R() * (b.w - 100), b.y + 50 + R() * (b.h - 100), lv(t)); }
-    for (let i = 0; i < C.LOOT_OUT; i++) { const a = R() * 6.2832, d = Math.sqrt(R()) * 3700, x = 4000 + Math.cos(a) * d, y = 4000 + Math.sin(a) * d; if (blocked(this.bl, x, y, 14)) continue; const t = roll(); this.addLoot(t, x, y, lv(t)); }
+    for (let i = 0; i < C.LOOT_OUT; i++) { const a = R() * 6.2832, d = Math.sqrt(R()) * 3700, x = 4000 + Math.cos(a) * d, y = 4000 + Math.sin(a) * d; if (this.hit(x, y, 14)) continue; const t = roll(); this.addLoot(t, x, y, lv(t)); }
   }
   addLoot(t, x, y, v) { const it = { id: this.nextL++, l: 1, t, x, y, v }; this.loot.set(it.id, it); const k = cell(x) * 100 + cell(y), a = this.lg.get(k); if (a) a.push(it); else this.lg.set(k, [it]); return it; }
   removeLoot(it) { this.loot.delete(it.id); const a = this.lg.get(cell(it.x) * 100 + cell(it.y)); if (a) { const i = a.indexOf(it); if (i >= 0) a.splice(i, 1); } }
@@ -172,7 +184,7 @@ export class MatchRoom {
     else if (t === 5) p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.4); else if (t === 6) this.addXp(p, it.v); else { p.w = t - 6; p.wr = it.v; }
     it.gone = true; this.rm.push(it); // idempotent: gone flag blocks double pickup
   }
-  hurt(e, dm, by, now) { if (now < this.startAt + C.GRACE_MS) return; let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (e.hp <= 0 && !e.killer) e.killer = by; }
+  hurt(e, dm, by, now) { if (now < this.startAt + C.GRACE_MS) return; let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (by) { e.dl = e.dl.filter((x) => now - x.t <= 5000); e.dl.push({ by, t: now, d: dm }); } if (e.hp <= 0 && !e.killer) e.killer = by; }
   addXp(p, n) {
     if (p.bot || n <= 0) return; p.xp += n | 0;
     while (p.lvl < 10 && p.xp >= C.XP_LV[p.lvl]) { p.lvl++; p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.2); p.lq++; }
@@ -215,7 +227,7 @@ export class MatchRoom {
     else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
     else { this.send(ws, [3, 'busy']); try { ws.close(1000, 'busy'); } catch {} return; }
     ws._p = p;
-    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV]);
+    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV, this.ob.map((o) => [o.x, o.y, o.r, o.t, o.v])]);
     ws.addEventListener('message', (e) => this.onMsg(p, ws, e.data));
     ws.addEventListener('close', () => this.onClose(p, ws));
     ws.addEventListener('error', () => this.onClose(p, ws));
@@ -239,7 +251,7 @@ export class MatchRoom {
     if (++ws._cnt > C.MAX_MSG_S) { this.strike(p, ws, 'flood'); try { ws.close(1008, 'rate'); } catch {} return; }
     if (typeof d !== 'string' || d.length > 40) return this.strike(p, ws, 'size');
     let a; try { a = JSON.parse(d); } catch { return this.strike(p, ws, 'json'); }
-    if (Array.isArray(a) && a.length === 2) return this.choose(p, ws, a);
+    if (Array.isArray(a) && a.length === 2) { if (a[0] === 8 && Number.isInteger(a[1])) { this.send(ws, [7, a[1]]); return; } return this.choose(p, ws, a); }
     if (!Array.isArray(a) || a.length !== 6 || !a.every(Number.isInteger)) return this.strike(p, ws, 'shape');
     const [seq, mx, my, aim, fire, auto] = a;
     if (seq <= p.seq || seq > p.seq + 1000 || Math.abs(mx) > 100 || Math.abs(my) > 100 || aim < 0 || aim > 359 || (fire !== 0 && fire !== 1) || (auto !== 0 && auto !== 1)) return this.strike(p, ws, 'range');
@@ -296,6 +308,11 @@ export class MatchRoom {
       if (!k.bot) { let xp; if (p.bot) xp = C.BOT_KILL_XP; else { xp = 80 + 25 * p.lvl; if (k.lvl - p.lvl >= 3) xp *= 0.6; else if (p.lvl - k.lvl >= 2) xp *= 1.5; } this.addXp(k, Math.round(xp)); }
     }
     this.addLoot(6, p.x, p.y, 60); // death crate (+60 XP)
+    { // assist: >=25% of victim max HP dealt by someone else within the last 5s -> 40% of base kill XP
+      const kx = p.bot ? C.BOT_KILL_XP : 80 + 25 * p.lvl, tot = new Map();
+      for (const x of p.dl) if (now - x.t <= 5000) tot.set(x.by, (tot.get(x.by) || 0) + x.d);
+      for (const [id, d] of tot) { const a = this.players.get(id); if (a && a !== k && a !== p && d >= 0.25 * p.maxHp) this.addXp(a, Math.round(0.4 * kx)); }
+    }
     this.send(p.ws, [2, p.place, p.kills]);
   }
 
@@ -337,15 +354,15 @@ export class MatchRoom {
       if (m > 0) {
         const f = Math.min(m, 100) / m, sp = C.SPEED * (1 + 0.1 * p.b[2]) * (p.bot ? C.BOT_SPEED : 1) * (Math.min(m, 100) / 100);
         const nx = p.x + (mx / m) * sp * dt, ny = p.y + (my / m) * sp * dt;
-        if (!blocked(this.bl, nx, p.y, C.R)) p.x = nx;
-        if (!blocked(this.bl, p.x, ny, C.R)) p.y = ny;
+        if (!this.hit(nx, p.y, C.R)) p.x = nx;
+        if (!this.hit(p.x, ny, C.R)) p.y = ny;
         p.x = Math.max(C.R, Math.min(C.WORLD - C.R, p.x)); p.y = Math.max(C.R, Math.min(C.WORLD - C.R, p.y));
       }
       if (p.fire && now >= p.cd) {
         const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr]; p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
         for (let n = 0; n < W0.n; n++) {
           const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
-          this.bullets.push({ id: this.nextB++, b: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(600, W0.rg * (1 + 0.12 * p.b[5])) });
+          this.bullets.push({ id: this.nextB++, b: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
         }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; }
@@ -357,7 +374,7 @@ export class MatchRoom {
       let dead = false;
       for (let s = 0; s < 4 && !dead; s++) {
         b.x += (b.vx * dt) / 4; b.y += (b.vy * dt) / 4;
-        if (b.x < 0 || b.y < 0 || b.x > C.WORLD || b.y > C.WORLD || blocked(this.bl, b.x, b.y, 0)) { dead = true; break; }
+        if (b.x < 0 || b.y < 0 || b.x > C.WORLD || b.y > C.WORLD || this.hit(b.x, b.y, 0)) { dead = true; break; }
         this.q(this.gP, b.x, b.y, 30, (e) => {
           if (dead || e.id === b.o || !e.alive) return;
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
