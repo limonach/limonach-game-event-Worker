@@ -98,7 +98,7 @@ export class MatchRoom {
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.lastPh = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
+    this.lastPh = 0; this.lastTk = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
   }
 
   genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
@@ -317,7 +317,7 @@ export class MatchRoom {
   }
 
   tick() {
-    const now = Date.now(), dt = 1 / C.TICK_HZ; this.tickN++;
+    const now = Date.now(), dt = Math.min(0.1, Math.max(0.01, (now - (this.lastTk || now - 50)) / 1000)); this.lastTk = now; this.tickN++;
     if (this.state === 'lobby') {
       if (!this.humans()) { if (this.timer) { clearInterval(this.timer); this.timer = null; } return; }
       const hum = this.humans();
@@ -362,7 +362,7 @@ export class MatchRoom {
         const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr]; p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
         for (let n = 0; n < W0.n; n++) {
           const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
-          this.bullets.push({ id: this.nextB++, b: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
+          this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
         }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; }
@@ -403,7 +403,7 @@ export class MatchRoom {
       for (const e of a) {
         if (e === h || e.x < x0 || e.x > x1 || e.y < y0 || e.y > y1) continue;
         seen.add(e.id);
-        if (e.b) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0]); } }
+        if (e.blt) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0]); } }
         else if (e.l) { if (!known.has(e.id)) { known.set(e.id, 1); L.push([e.id, e.t, e.x | 0, e.y | 0, e.v | 0]); } }
         else { const s = (e.x | 0) + ',' + (e.y | 0) + ',' + e.aim + ',' + Math.ceil(e.hp); if (known.get(e.id) !== s) { known.set(e.id, s); P.push([e.id, e.x | 0, e.y | 0, e.aim, Math.ceil(e.hp)]); } }
       }
