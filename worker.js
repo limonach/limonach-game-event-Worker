@@ -6,11 +6,14 @@ const C = {
   TICK_HZ: 20, SNAP_EVERY: 2,                 // TUNE: 20Hz sim, 10Hz snapshots
   MAX_PLAYERS: 52, START_HUMANS: 10, LOBBY_MS: 30000, // TUNE: start when 10 humans or 30s with >=1
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
-  R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 600,
+  R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 480, // TUNE: base range 480 so range boosts can reach the 600 cap
+  AUTO_RANGE: 450, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
   DC_GRACE_MS: 15000, MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
   ZONE_R0: 4000, ZONE_OFFSET: 300,
   PHASES: [[120, 45, 2800, 2], [60, 40, 1800, 4], [50, 35, 1000, 8], [40, 30, 450, 14], [30, 25, 0, 22]], // wait,shrink,endR,dps
-  BUILDINGS: 36, TOKEN_TTL_MS: 30000, JOIN_PER_MIN: 10,
+  BUILDINGS: 56, LOOT_IN: 4, LOOT_OUT: 160, PICK_R: 60, SHIELD_BASE: 50, PHASE_XP: 15, BOT_KILL_XP: 30, // TUNE
+  XP_LV: [0, 100, 250, 450, 700, 1000, 1400, 1900, 2500, 3200], XP_ITEM: [10, 25, 60],
+  TOKEN_TTL_MS: 30000, JOIN_PER_MIN: 10,
   PRICE_REQ_PER_M: 0.15, PRICE_GBS_PER_M: 12.5, DO_MEM_GB: 0.128 // TUNE: check current Cloudflare pricing
 };
 
@@ -21,7 +24,7 @@ const hkey = (secret, use) => crypto.subtle.importKey('raw', enc.encode(secret),
 const sign = async (secret, data) => b64u(await crypto.subtle.sign('HMAC', await hkey(secret, 'sign'), enc.encode(data)));
 const verify = async (secret, data, sig) => { try { return await crypto.subtle.verify('HMAC', await hkey(secret, 'verify'), unb64u(sig), enc.encode(data)); } catch { return false; } };
 const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
-const J = (o, s, h) => new Response(JSON.stringify(o), { status: s || 200, headers: { 'content-type': 'application/json', ...(h || {}) } });
+const J = (o, s, h) => new Response(JSON.stringify(o), { status: s || 200, headers: { 'content-type': 'application/json', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store', ...(h || {}) } });
 
 export default {
   async fetch(req, env) {
@@ -59,7 +62,7 @@ export default {
       }
 
       if (url.pathname === '/stats') {
-        if (!env.ADMIN_KEY || req.headers.get('x-admin') !== env.ADMIN_KEY) return new Response(null, { status: 404 });
+        if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
         return env.MATCH.get(env.MATCH.idFromName('stage1')).fetch(new Request('https://do/stats'));
       }
       return new Response(null, { status: 404 });
@@ -74,31 +77,41 @@ export default {
 function rng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
 const cell = (v) => Math.max(0, Math.min(39, Math.floor(v / C.CELL)));
 const circRect = (b, x, y, r) => { const dx = x - Math.max(b.x, Math.min(x, b.x + b.w)), dy = y - Math.max(b.y, Math.min(y, b.y + b.h)); return dx * dx + dy * dy < r * r; };
-const blocked = (bl, x, y, r) => { for (let i = 0; i < bl.length; i++) if (circRect(bl[i], x, y, r)) return true; return false; };
+const blocked = (bl, x, y, r) => { for (let i = 0; i < bl.length; i++) { const b = bl[i]; if (x < b.x - r || x > b.x + b.w + r || y < b.y - r || y > b.y + b.h + r) continue; const w = b.walls; for (let j = 0; j < w.length; j++) if (circRect(w[j], x, y, r)) return true; } return false; };
+const teq = (a, b) => { if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false; let r = 0; for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i); return r === 0; };
+function wallsOf(x, y, w, h, s) { // building = 4 walls (20u thick), 100u door gap on side s (0 top,1 right,2 bottom,3 left). MUST match client.
+  const t = 20, g = 100, o = [];
+  const hs = (yy, gap) => { if (gap) { const a = x + (w - g) / 2; o.push({ x, y: yy, w: a - x, h: t }, { x: a + g, y: yy, w: x + w - a - g, h: t }); } else o.push({ x, y: yy, w, h: t }); };
+  const vs = (xx, gap) => { if (gap) { const a = y + t + (h - 2 * t - g) / 2; o.push({ x: xx, y: y + t, w: t, h: a - y - t }, { x: xx, y: a + g, w: t, h: y + h - t - a - g }); } else o.push({ x: xx, y: y + t, w: t, h: h - 2 * t }); };
+  hs(y, s === 0); hs(y + h - t, s === 2); vs(x, s === 3); vs(x + w - t, s === 1); return o;
+}
 const nrm = (d) => ((Math.round(d) % 360) + 360) % 360;
 
 // ---------- Durable Object ----------
 export class MatchRoom {
-  constructor(state, env) { this.env = env; this.nonces = new Map(); this.timer = null; this.msgsIn = 0; this.reset(); }
+  constructor(state, env) { this.env = env; this.nonces = new Map(); this.banned = new Set(); this.timer = null; this.msgsIn = 0; this.reset(); }
 
   reset() {
     this.state = 'lobby'; this.seed = (Math.random() * 4294967296) >>> 0; this.R = rng(this.seed);
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.genMap(); this.genZone();
+    this.lastPh = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
   }
 
-  genMap() {
+  genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
     const R = this.R, bl = [];
-    for (let tries = 0; tries < 600 && bl.length < C.BUILDINGS; tries++) {
-      const w = 100 * (2 + Math.floor(R() * 4)), h = 100 * (2 + Math.floor(R() * 4));
-      const a = R() * 6.2832, d = Math.sqrt(R()) * 3500;
-      const x = Math.round((4000 + Math.cos(a) * d - w / 2) / 50) * 50, y = Math.round((4000 + Math.sin(a) * d - h / 2) / 50) * 50;
-      if (bl.some((b) => x < b.x + b.w + 150 && x + w + 150 > b.x && y < b.y + b.h + 150 && y + h + 150 > b.y)) continue;
-      bl.push({ x, y, w, h });
+    for (let tries = 0; tries < 2000 && bl.length < C.BUILDINGS; tries++) {
+      const w = 50 * (4 + Math.floor(R() * 6)), h = 50 * (4 + Math.floor(R() * 6));
+      const a = R() * 6.2832, d = Math.sqrt(R()) * 3700;
+      const x = Math.round((4000 + Math.cos(a) * d - w / 2) / 50) * 50, y = Math.round((4000 + Math.sin(a) * d - h / 2) / 50) * 50, s = Math.floor(R() * 4);
+      if (x < 100 || y < 100 || x + w > 7900 || y + h > 7900) continue;
+      if (bl.some((b) => x < b.x + b.w + 120 && x + w + 120 > b.x && y < b.y + b.h + 120 && y + h + 120 > b.y)) continue;
+      bl.push({ x, y, w, h, s, walls: wallsOf(x, y, w, h, s) });
     }
-    this.bl = bl;
+    this.bl = bl; this.rh = []; this.rv = [];
+    for (let i = 0; i < 4; i++) { this.rh.push(Math.round(1000 + i * 2000 + (R() - 0.5) * 600)); this.rv.push(Math.round(1000 + i * 2000 + (R() - 0.5) * 600)); }
+    this.dist = []; for (let i = 0; i < 16; i++) this.dist.push(Math.floor(R() * 3));
   }
 
   genZone() {
@@ -137,10 +150,43 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0 };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0 };
     this.players.set(p.id, p); return p;
   }
 
+  genLoot() { // server-only loot: 0 scrap,1 part,2 chip,3 small shield,4 large shield,5 repair,6 crate
+    this.loot = new Map(); this.lg = new Map(); this.nextL = 10000000; const R = this.R;
+    const roll = () => { const r = R(); return r < 0.45 ? 0 : r < 0.7 ? 1 : r < 0.8 ? 2 : r < 0.88 ? 3 : r < 0.92 ? 4 : r < 0.97 ? 5 : 6; };
+    for (const b of this.bl) for (let i = 0; i < C.LOOT_IN; i++) { const t = roll(); this.addLoot(t, b.x + 50 + R() * (b.w - 100), b.y + 50 + R() * (b.h - 100), t === 6 ? 40 + Math.floor(R() * 61) : 0); }
+    for (let i = 0; i < C.LOOT_OUT; i++) { const a = R() * 6.2832, d = Math.sqrt(R()) * 3700, x = 4000 + Math.cos(a) * d, y = 4000 + Math.sin(a) * d; if (blocked(this.bl, x, y, 14)) continue; const t = roll(); this.addLoot(t, x, y, t === 6 ? 40 + Math.floor(R() * 61) : 0); }
+  }
+  addLoot(t, x, y, v) { const it = { id: this.nextL++, l: 1, t, x, y, v }; this.loot.set(it.id, it); const k = cell(x) * 100 + cell(y), a = this.lg.get(k); if (a) a.push(it); else this.lg.set(k, [it]); return it; }
+  removeLoot(it) { this.loot.delete(it.id); const a = this.lg.get(cell(it.x) * 100 + cell(it.y)); if (a) { const i = a.indexOf(it); if (i >= 0) a.splice(i, 1); } }
+  take(p, it) {
+    const t = it.t;
+    if (t === 5 && p.hp >= p.maxHp) return; if ((t === 3 || t === 4) && p.shield >= p.maxSh) return;
+    if (t < 3) this.addXp(p, C.XP_ITEM[t]); else if (t === 3) p.shield = Math.min(p.maxSh, p.shield + 25); else if (t === 4) p.shield = Math.min(p.maxSh, p.shield + 50);
+    else if (t === 5) p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.4); else this.addXp(p, it.v);
+    it.gone = true; this.rm.push(it); // idempotent: gone flag blocks double pickup
+  }
+  hurt(e, dm, by, now) { let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (e.hp <= 0 && !e.killer) e.killer = by; }
+  addXp(p, n) {
+    if (p.bot || n <= 0) return; p.xp += n | 0;
+    while (p.lvl < 10 && p.xp >= C.XP_LV[p.lvl]) { p.lvl++; p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.2); p.lq++; }
+    if (!p.pend && p.lq > 0) this.offer(p);
+  }
+  offer(p) { // server generates 3 random boosts (stack cap 3), server validates the pick
+    const ok = []; for (let i = 0; i < 8; i++) if (p.b[i] < 3) ok.push(i);
+    if (!ok.length) { p.lq = 0; return; }
+    for (let i = ok.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [ok[i], ok[j]] = [ok[j], ok[i]]; }
+    p.pend = ok.slice(0, 3); this.send(p.ws, [5, p.lvl, p.pend]);
+  }
+  choose(p, ws, a) {
+    if (a[0] !== 9 || !p.pend || !Number.isInteger(a[1]) || a[1] < 0 || a[1] >= p.pend.length) return this.strike(p, ws, 'choice');
+    p.b[p.pend[a[1]]]++; p.pend = null; p.lq--;
+    const mh = C.HP * (1 + 0.15 * p.b[1]); p.hp += mh - p.maxHp; p.maxHp = mh; p.maxSh = C.SHIELD_BASE * (1 + 0.1 * p.b[4]);
+    if (p.lq > 0) this.offer(p);
+  }
   humans() { let n = 0; for (const p of this.players.values()) if (!p.bot) n++; return n; }
   connected() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.ws) n++; return n; }
   send(ws, arr) { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify(arr)); } catch {} }
@@ -160,12 +206,13 @@ export class MatchRoom {
 
   onOpen(ws, gid) {
     const now = Date.now(); ws._t0 = now; ws._win = 0; ws._cnt = 0;
+    if (this.banned.has(gid)) { try { ws.close(1008, 'policy'); } catch {} return; }
     let p = this.byGid.get(gid);
     if (p && !p.bot) { if (p.ws && p.ws !== ws) { try { p.ws.close(1000, 'dup'); } catch {} } p.ws = ws; p.dcAt = 0; }
     else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
     else { this.send(ws, [3, 'busy']); try { ws.close(1000, 'busy'); } catch {} return; }
     ws._p = p;
-    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h])]);
+    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV]);
     ws.addEventListener('message', (e) => this.onMsg(p, ws, e.data));
     ws.addEventListener('close', () => this.onClose(p, ws));
     ws.addEventListener('error', () => this.onClose(p, ws));
@@ -179,7 +226,7 @@ export class MatchRoom {
 
   strike(p, ws, kind) {
     p.strikes++; if (this.susp.length < 200) this.susp.push({ p: p.id, k: kind, t: Date.now() });
-    if (p.strikes >= C.MAX_STRIKES) { try { ws.close(1008, 'policy'); } catch {} }
+    if (p.strikes >= C.MAX_STRIKES) { if (p.gid) this.banned.add(p.gid); try { ws.close(1008, 'policy'); } catch {} }
   }
 
   onMsg(p, ws, d) {
@@ -189,11 +236,12 @@ export class MatchRoom {
     if (++ws._cnt > C.MAX_MSG_S) { this.strike(p, ws, 'flood'); try { ws.close(1008, 'rate'); } catch {} return; }
     if (typeof d !== 'string' || d.length > 40) return this.strike(p, ws, 'size');
     let a; try { a = JSON.parse(d); } catch { return this.strike(p, ws, 'json'); }
-    if (!Array.isArray(a) || a.length !== 5 || !a.every(Number.isInteger)) return this.strike(p, ws, 'shape');
-    const [seq, mx, my, aim, fire] = a;
-    if (seq <= p.seq || seq > p.seq + 1000 || Math.abs(mx) > 100 || Math.abs(my) > 100 || aim < 0 || aim > 359 || (fire !== 0 && fire !== 1)) return this.strike(p, ws, 'range');
+    if (Array.isArray(a) && a.length === 2) return this.choose(p, ws, a);
+    if (!Array.isArray(a) || a.length !== 6 || !a.every(Number.isInteger)) return this.strike(p, ws, 'shape');
+    const [seq, mx, my, aim, fire, auto] = a;
+    if (seq <= p.seq || seq > p.seq + 1000 || Math.abs(mx) > 100 || Math.abs(my) > 100 || aim < 0 || aim > 359 || (fire !== 0 && fire !== 1) || (auto !== 0 && auto !== 1)) return this.strike(p, ws, 'range');
     p.seq = seq; p.ack = seq;
-    if (p.alive) { p.mx = mx; p.my = my; p.aim = aim; p.fire = fire; }
+    if (p.alive) { p.mx = mx; p.my = my; p.aim = aim; p.fire = fire; p.maim = aim; p.mfire = fire; p.auto = auto; }
   }
 
   // spatial grid: key = cx*100+cy
@@ -240,7 +288,11 @@ export class MatchRoom {
     p.alive = false; p.hp = 0; p.fire = 0; p.mx = 0; p.my = 0;
     let alive = 0; for (const o of this.players.values()) if (o.alive) alive++;
     p.place = alive + 1;
-    const k = this.players.get(p.killer); if (k && k !== p) k.kills++;
+    const k = this.players.get(p.killer); if (k && k !== p) {
+      k.kills++;
+      if (!k.bot) { let xp; if (p.bot) xp = C.BOT_KILL_XP; else { xp = 80 + 25 * p.lvl; if (k.lvl - p.lvl >= 3) xp *= 0.6; else if (p.lvl - k.lvl >= 2) xp *= 1.5; } this.addXp(k, Math.round(xp)); }
+    }
+    this.addLoot(6, p.x, p.y, 60); // death crate (+60 XP)
     this.send(p.ws, [2, p.place, p.kills]);
   }
 
@@ -263,26 +315,36 @@ export class MatchRoom {
     // running
     const el = (now - this.startAt) / 1000; const z = this.z = this.zoneAt(el);
     const dps = el > C.HARD_CAP_S ? 200 : z.dps;
+    if (z.ph !== this.lastPh) { if (this.lastPh) for (const p of this.players.values()) if (p.alive) this.addXp(p, C.PHASE_XP); this.lastPh = z.ph; }
     if (this.connected() === 0) { if (!this.emptyAt) this.emptyAt = now; else if (now - this.emptyAt > 20000) { this.finish(now, 'empty'); return; } } else this.emptyAt = 0;
-    this.gP = this.grid(false);
+    this.gP = this.grid(false); this.rm = [];
     for (const p of this.players.values()) {
       if (!p.alive) continue;
       if (!p.bot && !p.ws && p.dcAt && now - p.dcAt > C.DC_GRACE_MS) { p.hp = 0; this.kill(p, now); continue; }
       if (p.bot && now >= p.thinkAt) { p.thinkAt = now + 200; this.think(p, now); }
+      if (!p.bot && p.auto) { // server-side auto-aim/auto-fire: nearest visible enemy in AUTO_RANGE, same rules for everyone
+        let tg = null, bd = 1e9;
+        this.q(this.gP, p.x, p.y, C.AUTO_RANGE, (e) => { if (e === p) return; const d = Math.hypot(e.x - p.x, e.y - p.y); if (d < bd && d <= C.AUTO_RANGE) { bd = d; tg = e; } });
+        if (now >= p.noiseAt) { p.noiseAt = now + 250; p.noise = (Math.random() * 2 - 1) * C.AUTO_ERR; }
+        if (tg) { p.aim = nrm(Math.atan2(tg.y - p.y, tg.x - p.x) * 57.2958 + p.noise); p.fire = 1; } else { p.aim = p.maim; p.fire = p.mfire; }
+      }
+      if (p.b[6] && now - p.hitAt > 5000 && p.hp < p.maxHp) p.hp = Math.min(p.maxHp, p.hp + p.b[6] * dt);
+      if (!p.bot) { const pr = C.PICK_R * (1 + 0.2 * p.b[7]); this.q(this.lg, p.x, p.y, pr, (it) => { if (!it.gone && Math.hypot(it.x - p.x, it.y - p.y) <= pr) this.take(p, it); }); } // server-side pickup range check
       let mx = p.mx, my = p.my; const m = Math.hypot(mx, my);
       if (m > 0) {
-        const f = Math.min(m, 100) / m, sp = C.SPEED * (Math.min(m, 100) / 100);
+        const f = Math.min(m, 100) / m, sp = C.SPEED * (1 + 0.1 * p.b[2]) * (Math.min(m, 100) / 100);
         const nx = p.x + (mx / m) * sp * dt, ny = p.y + (my / m) * sp * dt;
         if (!blocked(this.bl, nx, p.y, C.R)) p.x = nx;
         if (!blocked(this.bl, p.x, ny, C.R)) p.y = ny;
         p.x = Math.max(C.R, Math.min(C.WORLD - C.R, p.x)); p.y = Math.max(C.R, Math.min(C.WORLD - C.R, p.y));
       }
       if (p.fire && now >= p.cd) {
-        p.cd = now + C.COOLDOWN_MS; const r = p.aim * 0.0174533, c = Math.cos(r), s = Math.sin(r);
-        this.bullets.push({ id: this.nextB++, b: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * C.BSPEED, vy: s * C.BSPEED, dist: 0 });
+        p.cd = now + C.COOLDOWN_MS / (1 + 0.15 * p.b[3]); const r = p.aim * 0.0174533, c = Math.cos(r), s = Math.sin(r);
+        this.bullets.push({ id: this.nextB++, b: 1, o: p.id, x: p.x + c * 30, y: p.y + s * 30, vx: c * C.BSPEED, vy: s * C.BSPEED, dist: 0, rg: Math.min(600, C.RANGE * (1 + 0.12 * p.b[5])) });
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; }
     }
+    for (const it of this.rm) this.removeLoot(it);
     // bullets (3 substeps, vs walls and players)
     const keep = [];
     for (const b of this.bullets) {
@@ -293,11 +355,11 @@ export class MatchRoom {
         this.q(this.gP, b.x, b.y, 30, (e) => {
           if (dead || e.id === b.o || !e.alive) return;
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
-            dead = true; e.hp -= C.DMG; const o = this.players.get(b.o); if (o) o.dmg += C.DMG; if (e.hp <= 0 && !e.killer) e.killer = b.o;
+            dead = true; const o = this.players.get(b.o), dm = C.DMG * (o ? 1 + 0.12 * o.b[0] : 1); if (o) o.dmg += dm; this.hurt(e, dm, b.o, now);
           }
         });
       }
-      b.dist += C.BSPEED * dt; if (b.dist >= C.RANGE) dead = true;
+      b.dist += C.BSPEED * dt; if (b.dist >= b.rg) dead = true;
       if (!dead) keep.push(b);
     }
     this.bullets = keep;
@@ -311,19 +373,20 @@ export class MatchRoom {
   }
 
   snap(h, g, zArr, alive, el) {
-    const known = h.known, seen = new Set(), P = [], B = [];
+    const known = h.known, seen = new Set(), P = [], B = [], L = [];
     const x0 = h.x - C.VIEW_HX, x1 = h.x + C.VIEW_HX, y0 = h.y - C.VIEW_HY, y1 = h.y + C.VIEW_HY; // fixed server-side window
     for (let cx = cell(x0); cx <= cell(x1); cx++) for (let cy = cell(y0); cy <= cell(y1); cy++) {
-      const a = g.get(cx * 100 + cy); if (!a) continue;
+      const a0 = g.get(cx * 100 + cy), l0 = this.lg.get(cx * 100 + cy), a = a0 && l0 ? a0.concat(l0) : (a0 || l0); if (!a) continue;
       for (const e of a) {
         if (e === h || e.x < x0 || e.x > x1 || e.y < y0 || e.y > y1) continue;
         seen.add(e.id);
         if (e.b) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0]); } }
+        else if (e.l) { if (!known.has(e.id)) { known.set(e.id, 1); L.push([e.id, e.t, e.x | 0, e.y | 0]); } }
         else { const s = (e.x | 0) + ',' + (e.y | 0) + ',' + e.aim + ',' + Math.ceil(e.hp); if (known.get(e.id) !== s) { known.set(e.id, s); P.push([e.id, e.x | 0, e.y | 0, e.aim, Math.ceil(e.hp)]); } }
       }
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [h.x | 0, h.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills], P, B, G, zArr, alive, el | 0]);
+    this.send(h.ws, [1, this.tickN, h.ack, [h.x | 0, h.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl], P, B, G, zArr, alive, el | 0, L]);
   }
 
   finish(now, reason) {
