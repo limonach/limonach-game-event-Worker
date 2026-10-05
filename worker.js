@@ -8,7 +8,7 @@ const C = {
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
   R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 240, MAX_RANGE: 300, // TUNE: reach = range+58 must stay < 360 (half of 720 view height)
   WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spread: 0 }, { dmg: 7, cd: 850, sp: 1200, rg: 170, n: 5, spread: 9 }, { dmg: 24, cd: 650, sp: 2400, rg: 300, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
-  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000,
+  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_SEE: 330, BOT_PEACE_S: 75, BOT_VS_BOT: 0.5, BOT_LOOT_R: 450, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000,
   AC: { MIN_SHOTS: 50, ACC: 0.9, SNAPS: 30, NEAR_S: 120 }, // TUNE anti-cheat flags: manual-aim hit rate >=90% over 50+ shots, 30+ instant 120deg aim snaps while firing, 120s next to another human without any damage between them // TUNE: bots were too aggressive; 6s spawn grace
   AUTO_RANGE: 280, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
   DC_GRACE_MS: 15000, MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
@@ -230,7 +230,7 @@ const nrm = (d) => ((Math.round(d) % 360) + 360) % 360;
 
 // ---------- Durable Object ----------
 export class MatchRoom {
-  constructor(state, env) { this.state = state; this.mode = ''; this.mid = ''; this.closed = false; this.env = env; this.nonces = new Map(); this.banned = new Set(); this.timer = null; this.msgsIn = 0; this.reset(); }
+  constructor(state, env) { this.state = state; this.mode = ''; this.mid = ''; this.closed = false; this.env = env; this.nonces = new Map(); this.timer = null; this.msgsIn = 0; this.reset(); }
 
   reset() {
     this.state = 'lobby'; this.seed = (Math.random() * 4294967296) >>> 0; this.R = rng(this.seed);
@@ -303,7 +303,7 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', pid: null, party: '', team: 0, assists: 0, dieAt: 0 };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', skill: 0.6 + Math.random() * 0.4, aggr: Math.random(), tgt: 0, tgtAt: 0, side: 1, sideAt: 0, idleUntil: 0, ssd: 1, forceRoam: 0, skip: 0, skipUntil: 0, stuckN: 0, want: 0, cur: 0, chkAt: 0, cx: 0, cy: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0 };
     this.players.set(p.id, p); return p;
   }
 
@@ -362,7 +362,6 @@ export class MatchRoom {
 
   onOpen(ws, gid, pid, pt, ipc) {
     const now = Date.now(); ws._t0 = now; ws._win = 0; ws._cnt = 0;
-    if (this.banned.has(gid)) { try { ws.close(1008, 'policy'); } catch {} return; }
     let p = this.byGid.get(gid);
     if (p && !p.bot) { if (p.ws && p.ws !== ws) { try { p.ws.close(1000, 'dup'); } catch {} } p.ws = ws; p.dcAt = 0; }
     else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; p.ipc = String(ipc).slice(0, 10); this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
@@ -382,7 +381,7 @@ export class MatchRoom {
 
   strike(p, ws, kind) {
     p.strikes++; if (this.susp.length < 200) this.susp.push({ p: p.id, k: kind, t: Date.now() });
-    if (p.strikes >= C.MAX_STRIKES) { if (p.gid) this.banned.add(p.gid); try { ws.close(1008, 'policy'); } catch {} }
+    if (p.strikes >= C.MAX_STRIKES) { try { ws.close(1008, 'policy'); } catch {} } // disconnect only: never an automatic ban
   }
 
   onMsg(p, ws, d) {
@@ -433,24 +432,60 @@ export class MatchRoom {
     console.log(JSON.stringify({ ev: 'start', seed: this.seed, humans: this.humans(), bots: fill }));
   }
 
-  think(b, now) {
-    const z = this.z; let en = null, best = 1e9;
-    this.q(this.gP, b.x, b.y, C.BOT_RANGE, (e) => { if (e === b || e.team === b.team) return; const d = Math.hypot(e.x - b.x, e.y - b.y); if (d < best) { best = d; en = e; } });
-    const out = Math.hypot(b.x - z.cx, b.y - z.cy) > z.r - 250 || Math.hypot(b.x - z.tcx, b.y - z.tcy) > z.tr - 250;
-    b.fire = 0; let dx, dy;
-    if (out) { dx = z.tcx - b.x; dy = z.tcy - b.y; }
-    else if (en) {
-      const ex = en.x - b.x, ey = en.y - b.y;
-      b.aim = nrm(Math.atan2(ey, ex) * 57.2958 + (Math.random() * 2 - 1) * C.BOT_AIM_ERR);
-      b.fire = best < C.BOT_RANGE && Math.random() < C.BOT_FIRE_P ? 1 : 0;
-      if (best > 250) { dx = ex; dy = ey; } else { dx = -ey; dy = ex; }
-    } else {
-      if (!b.tx || Math.hypot(b.tx - b.x, b.ty - b.y) < 80 || Math.hypot(b.x - b.lx, b.y - b.ly) < 5) { b.tx = Math.max(100, Math.min(7900, b.x + (Math.random() - 0.5) * 1800)); b.ty = Math.max(100, Math.min(7900, b.y + (Math.random() - 0.5) * 1800)); }
-      dx = b.tx - b.x; dy = b.ty - b.y;
+  steer(b, dx, dy) { // obstacle avoidance: sweep 3 points along a 72u probe (not just the end point), rotate away from walls/rocks/trunks
+    const m = Math.hypot(dx, dy); if (m < 1) return [0, 0];
+    const base = Math.atan2(dy, dx);
+    for (const k of [0, 0.7, -0.7, 1.4, -1.4, 2.1, -2.1]) {
+      const a = base + k * b.ssd, c = Math.cos(a), s = Math.sin(a);
+      if (!this.hit(b.x + c * 24, b.y + s * 24, C.R + 2) && !this.hit(b.x + c * 48, b.y + s * 48, C.R + 2) && !this.hit(b.x + c * 72, b.y + s * 72, C.R + 2)) return [Math.round(c * 100), Math.round(s * 100)];
     }
-    b.lx = b.x; b.ly = b.y;
-    const m = Math.hypot(dx, dy) || 1; b.mx = Math.round((dx / m) * 100); b.my = Math.round((dy / m) * 100);
-    if (out || !en) b.aim = nrm(Math.atan2(dy, dx) * 57.2958);
+    return [Math.round(-Math.sin(base) * b.ssd * 100), Math.round(Math.cos(base) * b.ssd * 100)]; // boxed in: slide sideways instead of reversing (reversing causes wiggling)
+  }
+
+  // Bot states: flee zone > fight (react delay, strafe, retreat when hurt) > loot (shields/repair/weapons) > roam. Bots never fight each other in the first BOT_PEACE_S seconds.
+  think(b, now) {
+    const z = this.z, el = (now - this.startAt) / 1000, rg = Math.min(C.MAX_RANGE, C.WEAPONS[b.w].rg);
+    if (b.want && Math.hypot(b.x - b.lx, b.y - b.ly) < 6) b.stuckN++; else b.stuckN = 0; // asked to move but did not
+    let stuck = b.stuckN >= 4;
+    if (now >= b.chkAt) { if (b.chkAt && b.want && Math.hypot(b.x - b.cx, b.y - b.cy) < 60) stuck = true; b.cx = b.x; b.cy = b.y; b.chkAt = now + 3000; } // wiggling in place for 3 s also counts as stuck
+    if (stuck) { // recovery: flip steering side, forget the loot it could not reach, walk to a random point for 4 s
+      const a = Math.random() * 6.2832; b.ssd = -b.ssd; b.skip = b.cur; b.skipUntil = now + 20000; b.tgt = 0; b.forceRoam = now + 4000; b.stuckN = 0;
+      b.tx = Math.max(100, Math.min(7900, b.x + Math.cos(a) * 900)); b.ty = Math.max(100, Math.min(7900, b.y + Math.sin(a) * 900));
+    }
+    const free = now >= b.forceRoam;
+    let en = null, best = 1e9, it0 = null;
+    this.q(this.gP, b.x, b.y, C.BOT_SEE, (e) => {
+      if (e === b || e.team === b.team || (e.bot && el < C.BOT_PEACE_S)) return;
+      const d = Math.hypot(e.x - b.x, e.y - b.y); if (d < best) { best = d; en = e; }
+    });
+    const out = Math.hypot(b.x - z.cx, b.y - z.cy) > z.r - 250 || Math.hypot(b.x - z.tcx, b.y - z.tcy) > z.tr - 250;
+    if (now >= b.sideAt) { b.side = Math.random() < 0.5 ? 1 : -1; b.sideAt = now + 1000 + Math.random() * 1500; }
+    b.fire = 0; let dx = 0, dy = 0, face = null;
+    const hurt = b.hp < b.maxHp * (0.25 + 0.2 * b.aggr);
+    if (out && free) { dx = z.tcx - b.x; dy = z.tcy - b.y; }
+    else if (en && free) {
+      const ex = en.x - b.x, ey = en.y - b.y;
+      if (b.tgt !== en.id) { b.tgt = en.id; b.tgtAt = now + 350 + Math.random() * 550; } // human-like reaction delay
+      face = Math.atan2(ey, ex) * 57.2958 + (Math.random() * 2 - 1) * C.BOT_AIM_ERR * (1.6 - b.skill);
+      if (hurt && best < rg * 1.5) { dx = -ex; dy = -ey; } else if (best > rg * 0.8) { dx = ex; dy = ey; } else { dx = -ey * b.side; dy = ex * b.side; }
+      if (now >= b.tgtAt && best <= rg && Math.random() < C.BOT_FIRE_P * (0.5 + b.skill * 0.7) * (hurt ? 0.6 : 1)) b.fire = 1;
+    } else {
+      b.tgt = 0; let bd = 1e9;
+      if (free) this.q(this.lg, b.x, b.y, C.BOT_LOOT_R, (it) => {
+        const t = it.t; if (it.gone || !(t === 3 || t === 4 || t === 5 || t >= 7)) return; // shields, repair kits, weapons (not XP items)
+        if (it.id === b.skip && now < b.skipUntil) return; // unreachable loot is ignored for 20 s
+        if (t === 5 && b.hp >= b.maxHp) return; if ((t === 3 || t === 4) && b.shield >= b.maxSh) return; if (t >= 7 && b.w === t - 6 && b.wr >= it.v) return;
+        const d = Math.hypot(it.x - b.x, it.y - b.y); if (d < bd) { bd = d; it0 = it; }
+      });
+      if (it0) { if (bd <= C.PICK_R * 0.8) { this.take(b, it0); b.idleUntil = now + 400 + Math.random() * 800; it0 = null; } else { dx = it0.x - b.x; dy = it0.y - b.y; } }
+      else if (now >= b.idleUntil) {
+        if (!b.tx || Math.hypot(b.tx - b.x, b.ty - b.y) < 80) { b.tx = Math.max(100, Math.min(7900, b.x + (Math.random() - 0.5) * 1800)); b.ty = Math.max(100, Math.min(7900, b.y + (Math.random() - 0.5) * 1800)); }
+        dx = b.tx - b.x; dy = b.ty - b.y;
+      }
+    }
+    b.lx = b.x; b.ly = b.y; b.want = dx || dy ? 1 : 0; b.cur = it0 ? it0.id : 0;
+    const v = this.steer(b, dx, dy); b.mx = v[0]; b.my = v[1];
+    b.aim = nrm(face !== null ? face : (dx || dy ? Math.atan2(dy, dx) * 57.2958 : b.aim));
   }
 
   kill(p, now) {
@@ -516,7 +551,7 @@ export class MatchRoom {
         p.x = Math.max(C.R, Math.min(C.WORLD - C.R, p.x)); p.y = Math.max(C.R, Math.min(C.WORLD - C.R, p.y));
       }
       if (p.fire && now >= p.cd) {
-        const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr], man = !p.bot && !p.auto && W0.n === 1; if (man) p.shots++; // only manual single-bullet shots count for accuracy p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
+        const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr], man = !p.bot && !p.auto && W0.n === 1; if (man) p.shots++; /* only manual single-bullet shots count for accuracy */ p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
         for (let n = 0; n < W0.n; n++) {
           const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
           this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, man: man ? 1 : 0, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
@@ -535,7 +570,7 @@ export class MatchRoom {
         this.q(this.gP, b.x, b.y, 30, (e) => {
           if (dead || e.id === b.o || !e.alive || e.team === b.tm) return; // friendly fire off
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
-            dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG : 1) : 1); if (o) { o.dmg += dm; if (b.man) o.hits++; } this.hurt(e, dm, b.o, now);
+            dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG * (e.bot ? C.BOT_VS_BOT : 1) : 1) : 1); /* bots hit softer, and softer still against other bots */ if (o) { o.dmg += dm; if (b.man) o.hits++; } this.hurt(e, dm, b.o, now);
           }
         });
       }
