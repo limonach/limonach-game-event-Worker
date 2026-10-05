@@ -8,7 +8,8 @@ const C = {
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
   R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 240, MAX_RANGE: 300, // TUNE: reach = range+58 must stay < 360 (half of 720 view height)
   WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spread: 0 }, { dmg: 7, cd: 850, sp: 1200, rg: 170, n: 5, spread: 9 }, { dmg: 24, cd: 650, sp: 2400, rg: 300, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
-  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, // TUNE: bots were too aggressive; 6s spawn grace
+  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000,
+  AC: { MIN_SHOTS: 50, ACC: 0.9, SNAPS: 30, NEAR_S: 120 }, // TUNE anti-cheat flags: manual-aim hit rate >=90% over 50+ shots, 30+ instant 120deg aim snaps while firing, 120s next to another human without any damage between them // TUNE: bots were too aggressive; 6s spawn grace
   AUTO_RANGE: 280, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
   DC_GRACE_MS: 15000, MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
   ZONE_R0: 4000, ZONE_OFFSET: 300,
@@ -89,8 +90,9 @@ export default {
         if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
         const t = await rdTok(env, 'J1.', url.searchParams.get('t'));
         if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n)) return new Response(null, { status: 401 });
+        const ipc = (await sign(env.JOIN_SECRET, 'ip|' + ip + '|' + t.m)).slice(0, 10); // salted per match: same-network detection inside one match, no raw IP stored anywhere
         const r2 = new Request(req);
-        for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)]]) r2.headers.set(k, v);
+        for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)], ['x-ipc', ipc]]) r2.headers.set(k, v);
         return env.MATCH.get(env.MATCH.idFromName(t.m)).fetch(r2);
       }
 
@@ -235,7 +237,7 @@ export class MatchRoom {
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.lastPh = 0; this.lastTk = 0; this.tl = []; this.teams = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
+    this.lastPh = 0; this.lastTk = 0; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rm = []; this.genMap(); this.genZone(); this.genLoot();
   }
 
   genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
@@ -301,7 +303,7 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0 };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', pid: null, party: '', team: 0, assists: 0, dieAt: 0 };
     this.players.set(p.id, p); return p;
   }
 
@@ -321,7 +323,7 @@ export class MatchRoom {
     else if (t === 5) p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.4); else if (t === 6) this.addXp(p, it.v); else { p.w = t - 6; p.wr = it.v; }
     it.gone = true; this.rm.push(it); // idempotent: gone flag blocks double pickup
   }
-  hurt(e, dm, by, now) { if (now < this.startAt + C.GRACE_MS) return; let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (by) { e.dl = e.dl.filter((x) => now - x.t <= 5000); e.dl.push({ by, t: now, d: dm }); } if (e.hp <= 0 && !e.killer) e.killer = by; }
+  hurt(e, dm, by, now) { if (now < this.startAt + C.GRACE_MS) return; let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (by) { e.dl = e.dl.filter((x) => now - x.t <= 5000); e.dl.push({ by, t: now, d: dm }); const at = this.players.get(by); if (at) { if (!at.dmgTo) at.dmgTo = new Map(); at.dmgTo.set(e.id, (at.dmgTo.get(e.id) || 0) + dm); } } if (e.hp <= 0 && !e.killer) e.killer = by; }
   addXp(p, n) {
     if (p.bot || n <= 0) return; p.xp += n | 0;
     while (p.lvl < 10 && p.xp >= C.XP_LV[p.lvl]) { p.lvl++; p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.2); p.lq++; }
@@ -347,23 +349,23 @@ export class MatchRoom {
     const u = new URL(req.url);
     if (u.pathname === '/stats') return J(this.stats());
     if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
-    const gid = req.headers.get('x-u'), nonce = req.headers.get('x-nonce'), exp = +req.headers.get('x-exp'), md = req.headers.get('x-md'), mid = req.headers.get('x-m'), pid = req.headers.get('x-pid') || null, pt = req.headers.get('x-pt') || '';
+    const gid = req.headers.get('x-u'), nonce = req.headers.get('x-nonce'), exp = +req.headers.get('x-exp'), md = req.headers.get('x-md'), mid = req.headers.get('x-m'), pid = req.headers.get('x-pid') || null, pt = req.headers.get('x-pt') || '', ipc = req.headers.get('x-ipc') || '';
     if (!gid || !nonce || !mid || !K.TEAM[md] || this.nonces.has(nonce) || this.closed) return new Response(null, { status: 403 }); // replay protection
     if (this.mid && this.mid !== mid) return new Response(null, { status: 403 });
     if (!this.mid) { this.mid = mid; this.mode = md; }
     const now = Date.now(); this.nonces.set(nonce, exp);
     for (const [k, v] of this.nonces) if (v < now) this.nonces.delete(k);
     const pair = new WebSocketPair(); const [cl, sv] = Object.values(pair);
-    sv.accept(); this.onOpen(sv, gid, pid, pt);
+    sv.accept(); this.onOpen(sv, gid, pid, pt, ipc);
     return new Response(null, { status: 101, webSocket: cl });
   }
 
-  onOpen(ws, gid, pid, pt) {
+  onOpen(ws, gid, pid, pt, ipc) {
     const now = Date.now(); ws._t0 = now; ws._win = 0; ws._cnt = 0;
     if (this.banned.has(gid)) { try { ws.close(1008, 'policy'); } catch {} return; }
     let p = this.byGid.get(gid);
     if (p && !p.bot) { if (p.ws && p.ws !== ws) { try { p.ws.close(1000, 'dup'); } catch {} } p.ws = ws; p.dcAt = 0; }
-    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
+    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; p.ipc = String(ipc).slice(0, 10); this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
     else { this.send(ws, [3, 'busy']); try { ws.close(1000, 'busy'); } catch {} return; }
     ws._p = p;
     this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV, this.ob.map((o) => [o.x, o.y, o.r, o.t, o.v])]);
@@ -395,7 +397,10 @@ export class MatchRoom {
     const [seq, mx, my, aim, fire, auto] = a;
     if (seq <= p.seq || seq > p.seq + 1000 || Math.abs(mx) > 100 || Math.abs(my) > 100 || aim < 0 || aim > 359 || (fire !== 0 && fire !== 1) || (auto !== 0 && auto !== 1)) return this.strike(p, ws, 'range');
     p.seq = seq; p.ack = seq;
-    if (p.alive) { p.mx = mx; p.my = my; p.aim = aim; p.fire = fire; p.maim = aim; p.mfire = fire; p.auto = auto; }
+    if (p.alive) {
+      if (!auto && fire && p.lastIn && now - p.lastIn < 150) { let d = Math.abs(aim - p.maim); if (d > 180) d = 360 - d; if (d > 120) p.snaps++; } // instant large aim swing right before firing (aimbot signal)
+      p.lastIn = now; p.mx = mx; p.my = my; p.aim = aim; p.fire = fire; p.maim = aim; p.mfire = fire; p.auto = auto;
+    }
   }
 
   // spatial grid: key = cx*100+cy
@@ -489,9 +494,10 @@ export class MatchRoom {
     if (z.ph !== this.lastPh) { if (this.lastPh) for (const p of this.players.values()) if (p.alive) this.addXp(p, C.PHASE_XP); this.lastPh = z.ph; }
     if (this.connected() === 0) { if (!this.emptyAt) this.emptyAt = now; else if (now - this.emptyAt > 20000) { this.finish(now, 'empty'); return; } } else this.emptyAt = 0;
     this.gP = this.grid(false); this.rm = [];
+    if (now - this.lastNear >= 1000) { this.lastNear = now; this.nearCheck(); }
     for (const p of this.players.values()) {
       if (!p.alive) continue;
-      if (!p.bot && !p.ws && p.dcAt && now - p.dcAt > C.DC_GRACE_MS) { p.hp = 0; this.kill(p, now); continue; }
+      if (!p.bot && !p.ws && p.dcAt && now - p.dcAt > C.DC_GRACE_MS) { p.hp = 0; p.dcOut = 1; this.kill(p, now); continue; }
       if (p.bot && now >= p.thinkAt) { p.thinkAt = now + 200; this.think(p, now); }
       if (!p.bot && p.auto) { // server-side auto-aim/auto-fire: nearest visible enemy in AUTO_RANGE, same rules for everyone
         let tg = null, bd = 1e9;
@@ -510,10 +516,10 @@ export class MatchRoom {
         p.x = Math.max(C.R, Math.min(C.WORLD - C.R, p.x)); p.y = Math.max(C.R, Math.min(C.WORLD - C.R, p.y));
       }
       if (p.fire && now >= p.cd) {
-        const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr]; p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
+        const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr], man = !p.bot && !p.auto && W0.n === 1; if (man) p.shots++; // only manual single-bullet shots count for accuracy p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
         for (let n = 0; n < W0.n; n++) {
           const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
-          this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
+          this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, man: man ? 1 : 0, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
         }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; }
@@ -529,7 +535,7 @@ export class MatchRoom {
         this.q(this.gP, b.x, b.y, 30, (e) => {
           if (dead || e.id === b.o || !e.alive || e.team === b.tm) return; // friendly fire off
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
-            dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG : 1) : 1); if (o) o.dmg += dm; this.hurt(e, dm, b.o, now);
+            dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG : 1) : 1); if (o) { o.dmg += dm; if (b.man) o.hits++; } this.hurt(e, dm, b.o, now);
           }
         });
       }
@@ -574,14 +580,35 @@ export class MatchRoom {
     this.persist(now, hum).catch((e) => console.log('persist_fatal', String(e && e.message)));
   }
 
+  nearCheck() { // once per second: humans from different teams standing close together without ever damaging each other
+    const hs = []; for (const p of this.players.values()) if (!p.bot && p.alive) hs.push(p);
+    for (let i = 0; i < hs.length; i++) for (let j = i + 1; j < hs.length; j++) {
+      const a = hs[i], b = hs[j]; if (a.team === b.team || Math.abs(a.x - b.x) > 300 || Math.abs(a.y - b.y) > 300) continue;
+      if ((a.dmgTo && a.dmgTo.get(b.id)) || (b.dmgTo && b.dmgTo.get(a.id))) continue;
+      const k = a.id + '-' + b.id; this.near.set(k, (this.near.get(k) || 0) + 1);
+    }
+  }
+  flags(now, hum) {
+    const out = [], byId = new Map(hum.map((p) => [p.id, p])), add = (p, kind, detail) => { if (p && p.pid && out.length < 300) out.push({ player_id: p.pid, kind, detail }); };
+    const sc = new Map(); for (const s of this.susp) { const k = s.p + '|' + s.k; sc.set(k, (sc.get(k) || 0) + 1); }
+    for (const [k, n] of sc) { const [id, kind] = k.split('|'); add(byId.get(+id), 'msg_' + kind, { count: n }); }
+    for (const p of hum) {
+      if (p.shots >= C.AC.MIN_SHOTS && p.hits / p.shots >= C.AC.ACC) add(p, 'high_accuracy', { shots: p.shots, hits: p.hits, rate: +(p.hits / p.shots).toFixed(2) });
+      if (p.snaps >= C.AC.SNAPS) add(p, 'aim_snap', { snaps: p.snaps });
+      if (p.dcOut) add(p, 'dc_timeout', { at_s: Math.round(((p.dieAt || now) - this.startAt) / 1000) });
+    }
+    for (const [k, secs] of this.near) if (secs >= C.AC.NEAR_S) { const [a, b] = k.split('-').map(Number), pa = byId.get(a), pb = byId.get(b); add(pa, 'soft_team', { secs, with: pb ? pb.pid : null }); add(pb, 'soft_team', { secs, with: pa ? pa.pid : null }); }
+    const g = new Map(); for (const p of hum) if (p.ipc) { if (!g.has(p.ipc)) g.set(p.ipc, []); g.get(p.ipc).push(p); }
+    for (const l of g.values()) if (l.length > 1) for (const p of l) add(p, 'same_ip', { n: l.length });
+    return out;
+  }
   mm(path, body) { try { return this.env.MM.get(this.env.MM.idFromName('mm')).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }).catch(() => {}); } catch {} }
   tm(h) { const o = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h) o.push([m.id, m.x | 0, m.y | 0, m.alive ? 1 : 0]); return o; } // teammates only (minimap + markers)
   async persist(now, hum) { // ONE atomic, idempotent RPC at match end (zero writes during the match)
     const byId = new Map(hum.map((p) => [p.id, p]));
     const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills) }));
     if (!mp.length) return; // guests are never persisted
-    const agg = new Map(); for (const s of this.susp) { const p = byId.get(s.p); if (p && p.pid) { const k = p.pid + '|' + s.k; agg.set(k, (agg.get(k) || 0) + 1); } }
-    const sl = [...agg].slice(0, 200).map(([k, n]) => { const [pid, kind] = k.split('|'); return { player_id: pid, kind, detail: { count: n } }; });
+    const sl = this.flags(now, hum); // evidence rows for suspicion_logs (flag + log only: no automatic bans from statistics)
     const iso = (t) => new Date(t).toISOString();
     const body = JSON.stringify({ p: { m: { id: this.mid, mode: this.mode, seed: this.seed, started_at: iso(this.startAt), ended_at: iso(now), humans: hum.length, bots: this.players.size - hum.length, duration_s: Math.round((now - this.startAt) / 1000) }, mp, sl } });
     for (let i = 0; i < 3; i++) {
