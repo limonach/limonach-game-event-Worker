@@ -7,13 +7,13 @@ const C = {
   MAX_PLAYERS: 52, START_HUMANS: 10, LOBBY_MS: 30000, // TUNE: start when 10 humans or 30s with >=1
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
   R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 240, MAX_RANGE: 300, // TUNE: reach = range+58 must stay < 360 (half of 720 view height)
-  WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spread: 0 }, { dmg: 7, cd: 850, sp: 1200, rg: 170, n: 5, spread: 9 }, { dmg: 24, cd: 650, sp: 2400, rg: 300, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
+  WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spread: 0 }, { dmg: 9, cd: 800, sp: 1200, rg: 170, n: 5, spread: 7 }, { dmg: 26, cd: 520, sp: 2400, rg: 300, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
   BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_SEE: 330, BOT_PEACE_S: 75, BOT_VS_BOT: 0.5, BOT_LOOT_R: 450, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, BOT_COS: { skin: ['skin_crimson', 'skin_forest'], trail: ['trail_cyan', 'trail_pink'], fx: ['fx_blue', 'fx_green'] },
   AC: { MIN_SHOTS: 50, ACC: 0.9, SNAPS: 30, NEAR_S: 120 }, // TUNE anti-cheat flags: manual-aim hit rate >=90% over 50+ shots, 30+ instant 120deg aim snaps while firing, 120s next to another human without any damage between them // TUNE: bots were too aggressive; 6s spawn grace
   AUTO_RANGE: 280, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
   DC_GRACE_MS: 15000, MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
   ZONE_R0: 4000, ZONE_OFFSET: 300,
-  PHASES: [[120, 45, 2800, 2], [60, 40, 1800, 4], [50, 35, 1000, 8], [40, 30, 450, 14], [30, 25, 0, 22]], // wait,shrink,endR,dps
+  PHASES: [[150, 45, 2800, 2], [80, 40, 1800, 4], [70, 35, 1000, 8], [60, 30, 450, 14], [50, 25, 0, 22]], // wait,shrink,endR,dps. TUNE: spec waits were 120/60/50/40/30; pure-bot sims then ended ~7:00, these end ~8:30
   BUILDINGS: 56, ROCKS: 160, TREES: 240, LOOT_IN: 4, LOOT_OUT: 160, PICK_R: 60, SHIELD_BASE: 50, PHASE_XP: 15, BOT_KILL_XP: 30, // TUNE
   XP_LV: [0, 100, 250, 450, 700, 1000, 1400, 1900, 2500, 3200], XP_ITEM: [10, 25, 60],
   TOKEN_TTL_MS: 30000, JOIN_PER_MIN: 10,
@@ -61,7 +61,8 @@ const sb = (env, path, init = {}) => {
   if (!k.startsWith('sb_')) h.Authorization = 'Bearer ' + k; // new-style sb_secret_ keys are sent as apikey only
   return fetch(env.SUPABASE_URL + '/rest/v1/' + path, { ...init, headers: h });
 };
-async function rl(env, key, max) { // soft per-IP limit (KV is not atomic). Per-user atomic limits live in Matchmaker.
+async function rl(env, key, max) {
+  if (env.LOADTEST === '1') max *= 30; // TEMPORARY load-test switch: remove the LOADTEST variable after testing // soft per-IP limit (KV is not atomic). Per-user atomic limits live in Matchmaker.
   const k = 'rbr:rl:' + key + ':' + Math.floor(Date.now() / 60000), n = parseInt((await env.RL.get(k)) || '0', 10);
   if (n >= max) return false; await env.RL.put(k, String(n + 1), { expirationTtl: 120 }); return true;
 }
@@ -80,12 +81,12 @@ export default {
     const cors = okOrigin ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } : {};
     const ip = req.headers.get('CF-Connecting-IP') || 'x', P = url.pathname;
     try {
-      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors, 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,Authorization' } });
+      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...cors, 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,Authorization,x-admin' } });
       if (P === '/admin/stats') { // admin only: matchmaker + (optional) one match room
         if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
         const m = url.searchParams.get('m'), out = { mm: await (await mmStub(env).fetch('https://mm/stats', { method: 'POST', body: '{}' })).json() };
         if (m && UUID.test(m)) out.room = await (await env.MATCH.get(env.MATCH.idFromName(m)).fetch('https://do/stats')).json();
-        return J(out);
+        return J(out, 200, cors);
       }
       if (!okOrigin) return new Response(null, { status: 403 });
 
@@ -122,6 +123,28 @@ export default {
         if (!ses.pid) return J({ guest: 1 }, 200, cors);
         const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=level,total_xp,soft_currency,premium_currency');
         const row = r.ok ? (await r.json())[0] : null; return row ? J(row, 200, cors) : J({ e: 'err' }, 502, cors);
+      }
+      if (P === '/season' || P === '/season/claim') { // free track works now; the premium track is locked until a payment method exists
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        if (P === '/season' && req.method === 'GET') {
+          const nowIso = encodeURIComponent(new Date().toISOString());
+          const sr = await sb(env, 'seasons?select=id,name,ends_at,xp_per_tier,tiers&starts_at=lte.' + nowIso + '&ends_at=gte.' + nowIso + '&order=id.desc&limit=1'); const se = sr.ok ? (await sr.json())[0] : null;
+          if (!sr.ok) return J({ e: 'err' }, 502, cors); if (!se) return J({ season: null }, 200, cors);
+          if (!Number.isInteger(se.id)) return J({ e: 'err' }, 502, cors);
+          let rew = await env.RL.get('rbr:rew:' + se.id);
+          if (!rew) { const r = await sb(env, 'season_rewards?season_id=eq.' + se.id + '&select=tier,track,rtype,rsoft,rcos&order=tier.asc'); if (!r.ok) return J({ e: 'err' }, 502, cors); rew = JSON.stringify(await r.json()); await env.RL.put('rbr:rew:' + se.id, rew, { expirationTtl: 300 }); }
+          const [pr, cl] = await Promise.all([sb(env, 'season_progress?season_id=eq.' + se.id + '&player_id=eq.' + ses.pid + '&select=xp,premium'), sb(env, 'season_claims?season_id=eq.' + se.id + '&player_id=eq.' + ses.pid + '&select=tier,track')]);
+          if (!pr.ok || !cl.ok) return J({ e: 'err' }, 502, cors); const prog = (await pr.json())[0] || { xp: 0, premium: false };
+          return J({ season: se, xp: prog.xp, premium: prog.premium, rewards: JSON.parse(rew), claimed: await cl.json() }, 200, cors);
+        }
+        if (P !== '/season/claim' || req.method !== 'POST') return new Response(null, { status: 405 });
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'tier' && k !== 'track') || !Number.isInteger(b.tier) || b.tier < 1 || b.tier > 100 || (b.track !== 'free' && b.track !== 'premium')) return J({ e: 'bad' }, 400, cors);
+        const r = await sb(env, 'rpc/claim_season_tier', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid, tier: b.tier, track: b.track } }) });
+        if (!r.ok) { console.log('season_db', r.status); return J({ e: 'err' }, 502, cors); }
+        const j = await r.json(); if (j.ok) return J(j, 200, cors);
+        return J({ e: j.e || 'err' }, j.e === 'dup' || j.e === 'locked' || j.e === 'premium' ? 409 : 404, cors);
       }
       if (P === '/shop' || P === '/shop/buy' || P === '/shop/equip') { // cosmetics only: no stat advantages are for sale
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
@@ -268,7 +291,7 @@ export class MatchRoom {
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.lastPh = 0; this.lastTk = 0; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
+    this.lastPh = 0; this.lastTk = 0; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
   }
 
   genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
@@ -374,7 +397,7 @@ export class MatchRoom {
   }
   humans() { let n = 0; for (const p of this.players.values()) if (!p.bot) n++; return n; }
   connected() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.ws) n++; return n; }
-  send(ws, arr) { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify(arr)); } catch {} }
+  send(ws, arr) { try { if (ws && ws.readyState === 1) { const m = JSON.stringify(arr); this.bytesOut += m.length; ws.send(m); } } catch {} }
 
   async fetch(req) {
     const u = new URL(req.url);
@@ -543,11 +566,12 @@ export class MatchRoom {
   }
 
   tick() {
-    const now = Date.now(), dt = Math.min(0.1, Math.max(0.01, (now - (this.lastTk || now - 50)) / 1000)); this.lastTk = now; this.tickN++;
+    const now = Date.now(), gap = now - (this.lastTk || now - 1000 / C.TICK_HZ), dt = Math.min(0.1, Math.max(0.01, gap / 1000)); this.lastTk = now; this.tickN++;
+    if (this.state === 'running') { const lag = gap - 1000 / C.TICK_HZ; this.lagN++; this.lagSum += lag; if (lag > this.lagMax) this.lagMax = lag; if (lag > 50) this.late++; } // event-loop lateness: the CPU-saturation signal (Workers clocks do not advance during CPU work)
     if (this.state === 'lobby') {
       if (!this.humans()) { if (this.timer) { clearInterval(this.timer); this.timer = null; } return; }
       const hum = this.humans();
-      if (hum >= C.START_HUMANS || now - this.lobbyAt >= C.LOBBY_MS) this.startMatch(now);
+      if (hum >= (this.env.LOADTEST === '1' ? C.MAX_PLAYERS : C.START_HUMANS) || now - this.lobbyAt >= C.LOBBY_MS) this.startMatch(now);
       else if (now - this.lastLobbyMsg >= 1000) {
         this.lastLobbyMsg = now; const left = Math.ceil((C.LOBBY_MS - (now - this.lobbyAt)) / 1000);
         for (const p of this.players.values()) this.send(p.ws, [4, hum, left]);
@@ -693,6 +717,6 @@ export class MatchRoom {
     const reqs = this.msgsMatch / 20 + this.humans();
     const gbs = C.DO_MEM_GB * secs;
     const cost = (reqs * C.PRICE_REQ_PER_M) / 1e6 + (gbs * C.PRICE_GBS_PER_M) / 1e6;
-    return { mid: this.mid, mode: this.mode, teams: this.teams, state: this.state, humans: this.humans(), players: this.players.size, msgsInMatch: this.msgsMatch, msgsInTotal: this.msgsIn, matchSecs: Math.round(secs), billedReqEst: Math.round(reqs), socketSecs: Math.round(this.sockMs / 1000), costUsdEst: +cost.toFixed(5) };
+    return { lagAvgMs: this.lagN ? +(this.lagSum / this.lagN).toFixed(2) : 0, lagMaxMs: Math.round(this.lagMax), lateTicks: this.late, ticks: this.lagN, outKB: Math.round(this.bytesOut / 1024), mid: this.mid, mode: this.mode, teams: this.teams, state: this.state, humans: this.humans(), players: this.players.size, msgsInMatch: this.msgsMatch, msgsInTotal: this.msgsIn, matchSecs: Math.round(secs), billedReqEst: Math.round(reqs), socketSecs: Math.round(this.sockMs / 1000), costUsdEst: +cost.toFixed(5) };
   }
 }
