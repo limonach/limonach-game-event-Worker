@@ -61,10 +61,14 @@ const sb = (env, path, init = {}) => {
   if (!k.startsWith('sb_')) h.Authorization = 'Bearer ' + k; // new-style sb_secret_ keys are sent as apikey only
   return fetch(env.SUPABASE_URL + '/rest/v1/' + path, { ...init, headers: h });
 };
-async function rl(env, key, max) {
-  if (env.LOADTEST === '1') max *= 30; // TEMPORARY load-test switch: remove the LOADTEST variable after testing // soft per-IP limit (KV is not atomic). Per-user atomic limits live in Matchmaker.
-  const k = 'rbr:rl:' + key + ':' + Math.floor(Date.now() / 60000), n = parseInt((await env.RL.get(k)) || '0', 10);
-  if (n >= max) return false; await env.RL.put(k, String(n + 1), { expirationTtl: 120 }); return true;
+async function rl(env, key, max) { // per-key counter in a tiny Durable Object: atomic, no KV write limits (KV allows 1 write/sec/key and 1,000 writes/day on the free plan)
+  if (env.LOADTEST === '1') max *= 30; // TEMPORARY load-test switch: remove the LOADTEST variable after testing
+  try { const r = await env.RLIM.get(env.RLIM.idFromName(key)).fetch('https://rl', { method: 'POST', body: JSON.stringify({ max }) }); return (await r.json()).ok !== false; }
+  catch (e) { console.log('rl_err', String(e && e.message)); return true; } // fail open (availability); per-user throttles in the Matchmaker and in-room limits still apply
+}
+export class RateLimiter { // one instance per key (e.g. "join:<ip>"); fixed 60 s window, memory only
+  constructor() { this.n = 0; this.t = 0; }
+  async fetch(req) { let b; try { b = await req.json(); } catch { return J({ ok: true }); } const now = Date.now(); if (now - this.t >= 60000) { this.t = now; this.n = 0; } this.n++; return J({ ok: this.n <= (b.max | 0) }); }
 }
 async function flushPending(env) { // retry end-of-match writes that failed (idempotent RPC)
   const l = await env.RL.list({ prefix: 'rbr:pend:', limit: 20 });
