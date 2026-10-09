@@ -193,12 +193,12 @@ export default {
       if (P.startsWith('/party/') || P === '/leave' || P === '/join') {
         if (!(await rl(env, (P === '/join' ? 'join:' : 'party:') + ip, P === '/join' ? K.RL.join : K.RL.party))) return J({ e: 'slow' }, 429, cors);
         let b = {}; if (req.method === 'POST') { try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); } }
-        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'mode' && k !== 'code')) return J({ e: 'bad' }, 400, cors);
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'mode' && k !== 'code' && !(k === 'cap' && env.LOADTEST === '1'))) return J({ e: 'bad' }, 400, cors); /* cap = players per match, accepted ONLY while the temporary LOADTEST variable is set */
         if (P === '/join') {
           if (!K.TEAM[b.mode] || typeof b.mode !== 'string') return J({ e: 'bad' }, 400, cors);
           let cs = '';
           if (ses.pid) { const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=banned,player_cosmetics(cosmetic_id)&player_cosmetics.equipped=eq.true'); const row = r.ok ? (await r.json())[0] : null; if (!row) return J({ e: 'err' }, 503, cors); if (row.banned) return J({ e: 'banned' }, 403, cors); cs = pickCos(row.player_cosmetics); } // fail closed
-          const [st, j] = await mmCall(env, '/join', { u: ses.u, md: b.mode });
+          const [st, j] = await mmCall(env, '/join', { u: ses.u, md: b.mode, cap: env.LOADTEST === '1' && Number.isInteger(b.cap) ? b.cap : 0 });
           if (st !== 200) return J({ e: j.e || 'err' }, st, cors);
           const t = await mkTok(env, 'J1.', { u: ses.u, pid: ses.pid, m: j.m, md: j.md, pt: j.pt, cs, exp: Date.now() + K.JOIN_MS, n: hex(8) });
           return J({ t, md: j.md, m: j.m }, 200, cors);
@@ -226,9 +226,9 @@ export class Matchmaker {
     if (this.last.size > 2000) this.last.clear();
   }
   drop(c) { const p = this.parties.get(c); if (!p) return; for (const u of p.members) if (this.up.get(u) === c) this.up.delete(u); this.parties.delete(c); }
-  slot(md, n, now) {
+  slot(md, n, now, cap) {
     let o = this.open[md];
-    if (!o || o.n + n > C.MAX_PLAYERS || now - o.since > K.OPEN_MS) o = this.open[md] = { m: crypto.randomUUID(), since: now, n: 0 };
+    if (!o || o.n + n > (cap || C.MAX_PLAYERS) || now - o.since > K.OPEN_MS) o = this.open[md] = { m: crypto.randomUUID(), since: now, n: 0 };
     o.n += n; return o.m;
   }
   async fetch(req) {
@@ -257,18 +257,18 @@ export class Matchmaker {
     const lk = P + u; if (now - (this.last.get(lk) || 0) < (P === '/join' ? 1500 : 800)) return J({ e: 'slow' }, 429); this.last.set(lk, now);
     const code = this.up.get(u), pa = code && this.parties.get(code);
     if (P === '/join') {
-      const md = b.md, cur = this.um.get(u);
+      const md = b.md, cur = this.um.get(u), cap = (b.cap | 0) > 0 ? Math.min(b.cap | 0, C.MAX_PLAYERS) : 0;
       if (!K.TEAM[md]) return J({ e: 'bad' }, 400);
       if (cur) return J({ m: cur.m, md: cur.md, pt: cur.pt }); // one active match per user: re-issue a token for the same match
       if (pa) {
         if (!pa.match) {
           if (pa.leader !== u) return J({ e: 'leader' }, 409);
-          pa.match = { m: this.slot(md, pa.members.size, now), md };
+          pa.match = { m: this.slot(md, pa.members.size, now, cap), md };
         }
         this.um.set(u, { m: pa.match.m, md: pa.match.md, pt: code, t: now });
         return J({ m: pa.match.m, md: pa.match.md, pt: code });
       }
-      const m = this.slot(md, 1, now); this.um.set(u, { m, md, pt: '', t: now }); return J({ m, md, pt: '' });
+      const m = this.slot(md, 1, now, cap); this.um.set(u, { m, md, pt: '', t: now }); return J({ m, md, pt: '' });
     }
     if (P === '/leave') {
       const cur = this.um.get(u);
