@@ -150,6 +150,18 @@ export default {
         const j = await r.json(); if (j.ok) return J(j, 200, cors);
         return J({ e: j.e || 'err' }, j.e === 'dup' || j.e === 'locked' || j.e === 'premium' ? 409 : 404, cors);
       }
+      if (P === '/resume' && req.method === 'GET') { // returning after a page reload: is the player still inside a live match?
+        if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
+        const [st, j] = await mmCall(env, '/active', { u: ses.u }); if (st !== 200 || !j.m || !UUID.test(j.m) || !K.TEAM[j.md]) return J({ r: 0 }, 200, cors);
+        let r = 0; try { const x = await (await env.MATCH.get(env.MATCH.idFromName(j.m)).fetch('https://do/has?u=' + encodeURIComponent(ses.u))).json(); r = x && x.r ? 1 : 0; } catch (e) { console.log('resume_err'); }
+        return J({ r, md: j.md }, 200, cors);
+      }
+      if (P === '/invite' && req.method === 'GET') { // bot username for the share link, cached 24 h (the token never leaves the Worker and is never logged)
+        if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
+        let un = await env.RL.get('rbr:botun');
+        if (!un) { try { const r = await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/getMe'), j = r.ok ? await r.json() : null, n = j && j.result && j.result.username; if (typeof n === 'string' && /^[A-Za-z0-9_]{4,32}$/.test(n)) { un = n; await env.RL.put('rbr:botun', un, { expirationTtl: 86400 }); } } catch (e) { console.log('invite_err'); } }
+        return J({ u: un || null }, 200, cors);
+      }
       if (P === '/profile' || P === '/leaderboard') { // read-only screens
         if (req.method !== 'GET') return new Response(null, { status: 405 });
         if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
@@ -254,6 +266,7 @@ export class Matchmaker {
       if (e && e.m === b.m) { this.um.delete(u); const pc = this.up.get(u), pp = pc && this.parties.get(pc); if (pp && pp.match && pp.match.m === b.m && pp.leader === u) delete pp.match; }
       return J({ ok: 1 });
     }
+    if (P === '/active') { const e = this.um.get(u); return J(e ? { m: e.m, md: e.md } : { m: null }); }
     const lk = P + u; if (now - (this.last.get(lk) || 0) < (P === '/join' ? 1500 : 800)) return J({ e: 'slow' }, 429); this.last.set(lk, now);
     const code = this.up.get(u), pa = code && this.parties.get(code);
     if (P === '/join') {
@@ -430,6 +443,7 @@ export class MatchRoom {
   async fetch(req) {
     const u = new URL(req.url);
     if (u.pathname === '/stats') return J(this.stats());
+    if (u.pathname === '/has') { const p = this.byGid.get(u.searchParams.get('u') || ''); return J({ r: p && !p.bot && this.state !== 'ended' && !this.closed ? 1 : 0 }); } /* is this user still a member of this running match? (own session only: asked by the gateway) */
     if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
     const gid = req.headers.get('x-u'), nonce = req.headers.get('x-nonce'), exp = +req.headers.get('x-exp'), md = req.headers.get('x-md'), mid = req.headers.get('x-m'), pid = req.headers.get('x-pid') || null, pt = req.headers.get('x-pt') || '', ipc = req.headers.get('x-ipc') || '', cs = req.headers.get('x-cs') || '';
     if (!gid || !nonce || !mid || !K.TEAM[md] || this.nonces.has(nonce) || this.closed) return new Response(null, { status: 403 }); // replay protection
