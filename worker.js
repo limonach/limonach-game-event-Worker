@@ -8,7 +8,7 @@ const C = {
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
   R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 240, MAX_RANGE: 300, // TUNE: reach = range+58 must stay < 360 (half of 720 view height)
   WEAPONS: [{ dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spread: 0 }, { dmg: 9, cd: 800, sp: 1200, rg: 170, n: 5, spread: 7 }, { dmg: 26, cd: 520, sp: 2400, rg: 300, n: 1, spread: 0 }], RAR: [1, 1.2, 1.45], // TUNE: blaster, shotgun, laser; rarity dmg multipliers
-  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_SEE: 330, BOT_PEACE_S: 75, BOT_VS_BOT: 0.5, BOT_LOOT_R: 450, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, BOT_COS: { hull: ['hull_red', 'hull_green', 'hull_blue', 'hull_orange', 'hull_purple', 'hull_pink'], cannon: ['cannon_white', 'cannon_red'], track: ['track_white', 'track_blue'], detail: ['detail_yellow', 'detail_white'], glow: ['glow_blue', 'glow_green', 'glow_pink'] },
+  BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_SEE: 330, BOT_PEACE_S: 75, BOT_VS_BOT: 0.5, BOT_LOOT_R: 450, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, BOT_COS: { hull: ['hull_red', 'hull_green', 'hull_blue', 'hull_orange', 'hull_purple', 'hull_pink'], cannon: ['cannon_white', 'cannon_red'], track: ['track_white', 'track_blue'], detail: ['detail_yellow', 'detail_white'], glow: ['glow_blue', 'glow_green', 'glow_pink'], bullet: ['bullet_red', 'bullet_blue', 'bullet_green', 'bullet_pink'], blast: ['blast_red', 'blast_blue', 'blast_purple'], smoke: ['smoke_white', 'smoke_orange'], flag: ['flag_ma', 'flag_sa', 'flag_eg', 'flag_iq', 'flag_dz'] },
   AC: { MIN_SHOTS: 50, ACC: 0.9, SNAPS: 30, NEAR_S: 120 }, // TUNE anti-cheat flags: manual-aim hit rate >=90% over 50+ shots, 30+ instant 120deg aim snaps while firing, 120s next to another human without any damage between them // TUNE: bots were too aggressive; 6s spawn grace
   AUTO_RANGE: 280, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
   DC_GRACE_MS: 0, /* 0 = a disconnected player stays until he returns or the zone kills him; e.g. 120000 would eliminate him after 120 s */ MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
@@ -21,7 +21,7 @@ const C = {
 };
 
 const K = { SESSION_MS: 4 * 3600 * 1000, TG_MAX_AGE_S: 86400, JOIN_MS: 30000, OPEN_MS: 35000, PARTY_MAX: 4, PARTY_TTL_MS: 1800000, TEAM: { solo: 1, duo: 2, squad: 4 }, RL: { auth: 20, join: 15, party: 40, stats: 30, shop: 30 } }; // TUNE
-const COS_ID = /^(hull|cannon|track|detail|glow)_[a-z0-9]{2,12}$/;
+const COS_ID = /^(hull|cannon|track|detail|glow|bullet|trail|blast|smoke|flag)_[a-z0-9]{2,12}$/;
 const GEM_PACKS = [[100, 99], [310, 299], [520, 499], [1060, 999], [2180, 1999], [5600, 4999]]; /* gems, price in USD cents (display + audit; real payments are not built yet) */
 const pickCos = (rows) => { const got = {}; for (const r of Array.isArray(rows) ? rows : []) { const m = r && typeof r.cosmetic_id === 'string' ? COS_ID.exec(r.cosmetic_id) : null; if (m && !got[m[1]]) got[m[1]] = r.cosmetic_id; } return Object.values(got).join(','); }; // one equipped id per type, validated
 const parseCos = (s) => { const o = {}; for (const id of String(s).split(',')) { const m = COS_ID.exec(id); if (m && !o[m[1]]) o[m[1]] = id; } return o; };
@@ -107,7 +107,7 @@ export default {
       if (P === '/ws') {
         if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
         const t = await rdTok(env, 'J1.', url.searchParams.get('t'));
-        if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n) || !/^[a-z0-9_,]{0,120}$/.test(t.cs || '')) return new Response(null, { status: 401 });
+        if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n) || !/^[a-z0-9_,]{0,220}$/.test(t.cs || '')) return new Response(null, { status: 401 });
         const ipc = (await sign(env.JOIN_SECRET, 'ip|' + ip + '|' + t.m)).slice(0, 10); // salted per match: same-network detection inside one match, no raw IP stored anywhere
         const r2 = new Request(req);
         for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)], ['x-ipc', ipc], ['x-cs', t.cs || '']]) r2.headers.set(k, v);
@@ -225,10 +225,10 @@ export default {
           if (env.GEM_FREE_TEST !== '1') return J({ e: 'pay' }, 403, cors); /* real payment (Telegram Stars) is not built yet: without the test flag nobody can get gems */
           call = ['grant_gems', { pid: ses.pid, pack: b.pack, gems: GEM_PACKS[b.pack][0], usd: GEM_PACKS[b.pack][1] }];
         } else if (P === '/royale') {
-          if (Object.keys(b).some((k) => k !== 'kind' && k !== 'mode') || (b.kind !== 'free' && b.kind !== 'pro') || (b.mode !== 'one' && b.mode !== 'ten')) return J({ e: 'bad' }, 400, cors);
+          if (Object.keys(b).some((k) => k !== 'kind' && k !== 'mode') || (b.kind !== 'free' && b.kind !== 'pro' && b.kind !== 'flag') || (b.mode !== 'one' && b.mode !== 'ten')) return J({ e: 'bad' }, 400, cors);
           call = ['spin_royale', { pid: ses.pid, kind: b.kind, mode: b.mode }];
         } else {
-          if (Object.keys(b).some((k) => k !== 'id' && k !== 'type') || !(b.id === null || (typeof b.id === 'string' && COS_ID.test(b.id))) || (b.id === null && !['hull', 'cannon', 'track', 'detail', 'glow'].includes(b.type))) return J({ e: 'bad' }, 400, cors);
+          if (Object.keys(b).some((k) => k !== 'id' && k !== 'type') || !(b.id === null || (typeof b.id === 'string' && COS_ID.test(b.id))) || (b.id === null && !['hull', 'cannon', 'track', 'detail', 'glow', 'bullet', 'trail', 'blast', 'smoke', 'flag'].includes(b.type))) return J({ e: 'bad' }, 400, cors);
           call = ['equip_cosmetic', { pid: ses.pid, cid: b.id, type: b.type || null }];
         }
         const r = await sb(env, 'rpc/' + call[0], { method: 'POST', body: JSON.stringify({ p: call[1] }) });
@@ -561,8 +561,8 @@ export class MatchRoom {
     teams.forEach((t, i) => t.forEach((p) => { p.team = i + 1; }));
     for (const t of teams) for (let i = 1; i < t.length; i++) for (let n = 0; n < 20; n++) { const x = t[0].x + (Math.random() - 0.5) * 300, y = t[0].y + (Math.random() - 0.5) * 300; if (x > 50 && y > 50 && x < 7950 && y < 7950 && !this.hit(x, y, C.R + 10)) { t[i].x = x; t[i].y = y; break; } }
     this.tl = teams; this.teams = teams.length;
-    for (const p of all) if (p.bot) for (const t of ['hull', 'cannon', 'track', 'detail', 'glow']) if (Math.random() < 0.4) p.cs[t] = C.BOT_COS[t][Math.floor(Math.random() * C.BOT_COS[t].length)]; // bots wear common items so they look like players
-    this.rosterMsg = [6, all.map((p) => [p.id, p.cs.hull || '', p.cs.cannon || '', p.cs.track || '', p.cs.detail || '', p.cs.glow || ''])]; // cosmetic ids only (no positions): visual info, validated server-side
+    for (const p of all) if (p.bot) for (const t of Object.keys(C.BOT_COS)) if (Math.random() < (t === 'flag' || t === 'smoke' ? 0.15 : 0.4)) p.cs[t] = C.BOT_COS[t][Math.floor(Math.random() * C.BOT_COS[t].length)]; // bots wear common items so they look like players
+    this.rosterMsg = [6, all.map((p) => [p.id, p.cs.hull || '', p.cs.cannon || '', p.cs.track || '', p.cs.detail || '', p.cs.glow || '', p.cs.bullet || '', p.cs.trail || '', p.cs.blast || '', p.cs.smoke || '', p.cs.flag || ''])]; // cosmetic ids only (no positions): visual info, validated server-side
     for (const p of hum) this.send(p.ws, this.rosterMsg);
     this.mm('/started', { m: this.mid, md: this.mode });
     this.state = 'running'; this.startAt = now; this.msgsMatch = 0;
