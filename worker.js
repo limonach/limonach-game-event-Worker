@@ -596,7 +596,7 @@ export class MatchRoom {
     p.dieAt = now; const at = new Set(); for (const o of this.players.values()) if (o.alive) at.add(o.team);
     p.place = at.size + 1; // team placement: set for the whole team once its last member dies
     const teamOut = !at.has(p.team);
-    if (teamOut) { const us = []; for (const o of this.players.values()) if (o.team === p.team) { o.place = at.size + 1; if (!o.bot) { us.push(o.gid); if (o !== p) this.send(o.ws, [2, o.place, o.kills, 1]); } } if (us.length) this.mm('/out', { m: this.mid, us }); }
+    if (teamOut) { const us = []; for (const o of this.players.values()) if (o.team === p.team) { o.place = at.size + 1; if (!o.bot) { us.push(o.gid); if (o !== p) this.send(o.ws, this.res(o, 1, now)); } } if (us.length) this.mm('/out', { m: this.mid, us }); }
     const k = this.players.get(p.killer); if (k && k !== p) {
       k.kills++;
       if (!k.bot) { let xp; if (p.bot) xp = C.BOT_KILL_XP; else { xp = 80 + 25 * p.lvl; if (k.lvl - p.lvl >= 3) xp *= 0.6; else if (p.lvl - k.lvl >= 2) xp *= 1.5; } this.addXp(k, Math.round(xp)); }
@@ -607,7 +607,7 @@ export class MatchRoom {
       for (const x of p.dl) if (now - x.t <= 5000) tot.set(x.by, (tot.get(x.by) || 0) + x.d);
       for (const [id, d] of tot) { const a = this.players.get(id); if (a && a !== k && a !== p && d >= 0.25 * p.maxHp) { this.addXp(a, Math.round(0.4 * kx)); a.assists = (a.assists || 0) + 1; } }
     }
-    this.send(p.ws, [2, p.place, p.kills, teamOut ? 1 : 0]);
+    this.send(p.ws, this.res(p, teamOut ? 1 : 0, now));
   }
 
   tick() {
@@ -691,6 +691,7 @@ export class MatchRoom {
     }
   }
 
+  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams]; }
   specOf(h) { /* dead player in duo/squad: follow a living teammate (shows exactly what that teammate already sees) */
     const l = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h && m.alive) l.push(m);
     if (!l.length) return null;
@@ -718,7 +719,7 @@ export class MatchRoom {
   finish(now, reason) {
     this.state = 'ended'; this.endAt = now;
     const s = this.stats();
-    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg)]); }
+    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams]); }
     for (const p of this.players.values()) if (p.ws) p.ws._t0 = now;
     console.log(JSON.stringify({ ev: 'end', reason, ...s, suspicious: this.susp.length }));
     const hum = [...this.players.values()].filter((p) => !p.bot);
