@@ -92,6 +92,15 @@ export default {
         if (m && UUID.test(m)) out.room = await (await env.MATCH.get(env.MATCH.idFromName(m)).fetch('https://do/stats')).json();
         return J(out, 200, cors);
       }
+      if (P === '/adsgram/reward' && req.method === 'GET') { /* server-to-server postback from AdsGram (no Origin header): records "this Telegram user finished a reward ad". Clients can never create this record. */
+        const uid = url.searchParams.get('userid') || '', kk = url.searchParams.get('k') || '';
+        if (!env.ADSGRAM_SECRET || !teq(kk, env.ADSGRAM_SECRET)) return new Response(null, { status: 404 });
+        if (!/^[0-9]{1,15}$/.test(uid)) return J({ e: 'bad' }, 400);
+        if (!(await rl(env, 'adr:' + uid, 10))) return J({ e: 'slow' }, 429);
+        const r = await sb(env, 'rpc/add_ad_credit', { method: 'POST', body: JSON.stringify({ p: { tid: Number(uid) } }) });
+        if (!r.ok) { console.log('adr_db', r.status); return J({ e: 'err' }, 502); }
+        return J({ ok: 1 });
+      }
       if (!okOrigin) return new Response(null, { status: 403 });
 
       if (P === '/ws') {
@@ -113,7 +122,7 @@ export default {
           const r = await sb(env, 'players?on_conflict=telegram_id', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: JSON.stringify([{ telegram_id: tg.id, name: tg.name }]) });
           const row = r.ok ? (await r.json())[0] : null; if (!row) { console.log('auth_db', r.status); return J({ e: 'err' }, 502, cors); }
           if (row.banned) return J({ e: 'banned' }, 403, cors);
-          return J({ s: await mkTok(env, 'S1.', { u: 'p:' + row.id, pid: row.id, exp: Date.now() + K.SESSION_MS }), lvl: row.level, xp: row.total_xp, soft: row.soft_currency }, 200, cors);
+          return J({ s: await mkTok(env, 'S1.', { u: 'p:' + row.id, pid: row.id, tid: tg.id, exp: Date.now() + K.SESSION_MS }), lvl: row.level, xp: row.total_xp, soft: row.soft_currency }, 200, cors);
         }
         if (env.ALLOW_GUEST !== '1') return J({ e: 'auth' }, 401, cors);
         return J({ s: await mkTok(env, 'S1.', { u: 'g:' + hex(8), pid: null, exp: Date.now() + K.SESSION_MS }), guest: 1 }, 200, cors);
@@ -149,6 +158,23 @@ export default {
         if (!r.ok) { console.log('season_db', r.status); return J({ e: 'err' }, 502, cors); }
         const j = await r.json(); if (j.ok) return J(j, 200, cors);
         return J({ e: j.e || 'err' }, j.e === 'dup' || j.e === 'locked' || j.e === 'premium' ? 409 : 404, cors);
+      }
+      if (P === '/daily' || P === '/daily/claim') { /* DAILY CHECK: 100 coins a day, 400 on day 7; each claim needs a fresh server-verified AdsGram ad */
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        if (P === '/daily' && req.method === 'GET') {
+          const r = await sb(env, 'rpc/get_daily', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) });
+          if (!r.ok) { console.log('daily_db', r.status); return J({ e: 'err' }, 502, cors); }
+          const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
+        }
+        if (P !== '/daily/claim' || req.method !== 'POST') return new Response(null, { status: 405 });
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || Object.keys(b).length) return J({ e: 'bad' }, 400, cors);
+        if (!Number.isSafeInteger(ses.tid)) return J({ e: 'auth' }, 401, cors);
+        const r = await sb(env, 'rpc/claim_daily', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid, tid: ses.tid } }) });
+        if (!r.ok) { console.log('daily_claim_db', r.status); return J({ e: 'err' }, 502, cors); }
+        const j = await r.json(); if (j.ok) return J(j, 200, cors);
+        return J({ e: j.e || 'err' }, j.e === 'dup' || j.e === 'noad' ? 409 : 404, cors);
       }
       if (P === '/resume' && req.method === 'GET') { // returning after a page reload: is the player still inside a live match?
         if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
