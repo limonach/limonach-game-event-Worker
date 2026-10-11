@@ -35,7 +35,7 @@ const verify = async (secret, data, sig) => { try { return await crypto.subtle.v
 const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
 const J = (o, s, h) => new Response(JSON.stringify(o), { status: s || 200, headers: { 'content-type': 'application/json', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store', ...(h || {}) } });
 const PCOINS = [150, 125, 110, 100, 90, 80, 70, 65, 60, 55, 50, 45, 40, 35]; /* coins by team placement 1..14, then 15-20: 30, 21-30: 20, 31-40: 15, 41-52: 10 */
-const reward = (place, kills, score) => (place <= 14 ? PCOINS[Math.max(1, place) - 1] : place <= 20 ? 30 : place <= 30 ? 20 : place <= 40 ? 15 : 10) + kills * 15 + (score >= 80 ? 50 : 0); // TUNE: coins per match = placement table + 15 per kill + 50 if MATCH SCORE >= 80 (server-side only; SQL also caps it at 1000)
+const reward = (place, kills, score) => (place <= 14 ? PCOINS[Math.max(1, place) - 1] : place <= 20 ? 30 : place <= 30 ? 20 : place <= 40 ? 15 : 10) + Math.min(kills, 10) * 5 + (score >= 80 ? 50 : 0); // TUNE: coins per match = placement table + 5 per kill (max 10 kills count) + 50 if MATCH SCORE >= 80 (server-side only; SQL also caps it at 1000)
 
 // Signed tokens: base64url(json) + '.' + HMAC(domain + payload). Domains separate session tokens (S1.) from match-join tokens (J1.).
 async function mkTok(env, dom, obj) { const p = b64u(enc.encode(JSON.stringify(obj))); return p + '.' + (await sign(env.JOIN_SECRET, dom + p)); }
@@ -115,14 +115,16 @@ export default {
       }
       if (P === '/adsgram/reward' && req.method === 'GET') { /* server-to-server postback from AdsGram (no Origin header): records "this Telegram user finished a reward ad". Clients can never create this record. */
         const uid = url.searchParams.get('userid') || '', kk = url.searchParams.get('k') || '';
-        if (!env.ADSGRAM_SECRET || !teq(kk, env.ADSGRAM_SECRET)) return new Response(null, { status: 404 });
-        if (!/^[0-9]{1,15}$/.test(uid)) return J({ e: 'bad' }, 400);
+        if (!env.ADSGRAM_SECRET) { console.log('adr_reject: ADSGRAM_SECRET is not set on the Worker'); return J({ e: 'secret_not_set' }, 503); } /* tells YOU the secret is missing; reveals nothing about its value */
+        if (!teq(kk, env.ADSGRAM_SECRET)) { console.log('adr_reject: wrong or missing k'); return new Response(null, { status: 404 }); }
+        if (!/^[0-9]{1,15}$/.test(uid)) { console.log('adr_reject: userid is not a number'); return J({ e: 'bad' }, 400); }
         const kind = url.searchParams.get('b') || 'daily'; /* which AdsGram block was watched: daily | x2 | gem (no b = the old daily URL) */
-        if (kind !== 'daily' && kind !== 'x2' && kind !== 'gem') return J({ e: 'bad' }, 400);
+        if (kind !== 'daily' && kind !== 'x2' && kind !== 'gem') { console.log('adr_reject: unknown b=' + kind.slice(0, 12)); return J({ e: 'bad' }, 400); }
         if (!(await rl(env, 'adr:' + uid, 10))) return J({ e: 'slow' }, 429);
         const r = await sb(env, 'rpc/add_ad_credit', { method: 'POST', body: JSON.stringify({ p: { tid: Number(uid), kind } }) });
         if (!r.ok) { console.log('adr_db', r.status); return J({ e: 'err' }, 502); }
-        return J({ ok: 1 });
+        const j = await r.json(); console.log('adr', kind, j && j.ok ? 'credit_created' : 'no_credit:' + (j && j.e)); /* the answer now says what REALLY happened: ok only if a credit exists */
+        return J(j && j.ok ? { ok: 1, b: kind } : { ok: 0, e: (j && j.e) || 'err' });
       }
       if (!okOrigin) return new Response(null, { status: 403 });
 
