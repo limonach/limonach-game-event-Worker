@@ -39,7 +39,7 @@ binding = "RL"
 id = "90b4297ff1a64a919c35b3e0b60cbe5f"
 
 [triggers]
-crons = ["*/10 * * * *"]   # retries any end-of-match write that failed
+crons = ["*/10 * * * *", "0 6 * * *"]   # retries any end-of-match write that failed
 
 # LOAD TESTS ONLY: add this line under [vars] (and delete it again afterwards):
 # LOADTEST = "1"

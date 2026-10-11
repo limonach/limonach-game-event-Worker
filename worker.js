@@ -11,7 +11,7 @@ const C = {
   BOT_DMG: 0.5, BOT_CD: 1.8, BOT_RANGE: 260, BOT_SEE: 330, BOT_PEACE_S: 75, BOT_VS_BOT: 0.5, BOT_LOOT_R: 450, BOT_AIM_ERR: 18, BOT_FIRE_P: 0.35, BOT_SPEED: 0.8, GRACE_MS: 6000, BOT_COS: { hull: ['hull_red', 'hull_green', 'hull_blue', 'hull_orange', 'hull_purple', 'hull_pink'], cannon: ['cannon_white', 'cannon_red'], track: ['track_white', 'track_blue'], detail: ['detail_yellow', 'detail_white'], glow: ['glow_blue', 'glow_green', 'glow_pink'], bullet: ['bullet_red', 'bullet_blue', 'bullet_green', 'bullet_pink'], blast: ['blast_red', 'blast_blue', 'blast_purple'], smoke: ['smoke_white', 'smoke_orange'], flag: ['flag_ma', 'flag_sa', 'flag_eg', 'flag_iq', 'flag_dz'] },
   AC: { MIN_SHOTS: 50, ACC: 0.9, SNAPS: 30, NEAR_S: 120 }, // TUNE anti-cheat flags: manual-aim hit rate >=90% over 50+ shots, 30+ instant 120deg aim snaps while firing, 120s next to another human without any damage between them // TUNE: bots were too aggressive; 6s spawn grace
   AUTO_RANGE: 280, AUTO_ERR: 6, // TUNE: auto-aim range (< weapon range) and random aim error in degrees
-  DC_GRACE_MS: 0, /* 0 = a disconnected player stays until he returns or the zone kills him; e.g. 120000 would eliminate him after 120 s */ MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600,
+  DC_GRACE_MS: 0, /* 0 = a disconnected player stays until he returns or the zone kills him; e.g. 120000 would eliminate him after 120 s */ MAX_MSG_S: 30, MAX_STRIKES: 8, HARD_CAP_S: 600, OUT_MS: 15000, /* room ends this long after the last LIVING human is out */
   ZONE_R0: 4000, ZONE_OFFSET: 300,
   PHASES: [[150, 45, 2800, 2], [80, 40, 1800, 4], [70, 35, 1000, 8], [60, 30, 450, 14], [50, 25, 0, 22]], // wait,shrink,endR,dps. TUNE: spec waits were 120/60/50/40/30; pure-bot sims then ended ~7:00, these end ~8:30
   BUILDINGS: 56, ROCKS: 160, TREES: 240, LOOT_IN: 4, LOOT_OUT: 160, PICK_R: 60, SHIELD_BASE: 50, PHASE_XP: 15, BOT_KILL_XP: 30, // TUNE
@@ -75,7 +75,7 @@ async function flushPending(env) { // retry end-of-match writes that failed (ide
   const l = await env.RL.list({ prefix: 'rbr:pend:', limit: 20 });
   for (const k of l.keys) { const v = await env.RL.get(k.name); if (!v) continue; try { const r = await sb(env, 'rpc/finish_match', { method: 'POST', body: v }); if (r.ok) await env.RL.delete(k.name); } catch {} }
 }
-const RK = { MIN_ACC: 8, MIN_NET: 6, FIELD_MIN: 5, FULL_TH: 6, /* TUNE: ranked needs 8+ real accounts from 6+ different networks; placement is measured among HUMAN teams only */
+const RK = { MIN_ACC: 8, MIN_NET: 6, LITE: 1, FIELD_MIN: 5, FULL_TH: 6, /* LITE: TEMPORARY - 1 = a match with even ONE real account still counts for RANK (placement only, among all teams); set 0 to require the full 8-player quorum for rank again. Season points ALWAYS need the full quorum. */ /* TUNE: ranked needs 8+ real accounts from 6+ different networks; placement is measured among HUMAN teams only */
   KNOTS: [[0, 35], [0.0196, 30], [0.039, 27], [0.059, 24], [0.078, 21], [0.098, 15], [0.176, 5], [0.196, 0], [0.372, -10], [0.392, -15], [0.569, -15], [0.588, -20], [0.765, -20], [0.784, -25], [1, -25]] }; /* placement points by percentile (your solo table, stretched to any number of teams) */
 function rankDelta(o) { /* RP change of ONE human for ONE match. o = { ranked, th (human teams), ph (human-team place), kills (HUMAN kills only), score, engaged, mode } */
   if (!o.ranked) return 0;
@@ -85,11 +85,20 @@ function rankDelta(o) { /* RP change of ONE human for ONE match. o = { ranked, t
   const kp = Math.min(10, 2 * o.kills), bonus = o.engaged ? (o.score >= 81 ? 30 : o.score >= 60 ? 20 : 0) : 0; /* score bonus only if you actually fought a human */
   return Math.max(-30, Math.min(80, Math.round(pp + kp + bonus)));
 }
+function liteDelta(lp, teams) { /* TEMPORARY ranked-with-few-players: RP from overall placement only (bots count as opponents), gains halved, no kill / score bonus */
+  const x = teams > 1 ? Math.min(1, (lp - 1) / (teams - 1)) : 0; let pp = 0;
+  for (let i = 1; i < RK.KNOTS.length; i++) { const a = RK.KNOTS[i - 1], b = RK.KNOTS[i]; if (x <= b[0]) { pp = a[1] + (b[1] - a[1]) * ((x - a[0]) / (b[0] - a[0])); break; } }
+  if (pp > 0) pp *= 0.5;
+  return Math.max(-30, Math.min(80, Math.round(pp)));
+}
+async function keepAlive(env) { /* one tiny read per day so the free Supabase project never counts as inactive (it pauses after ~7 idle days) */
+  try { const r = await sb(env, 'seasons?select=id&limit=1'); console.log('keepalive', r.status); } catch (e) { console.log('keepalive_err', String(e && e.message)); }
+}
 const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
 const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
 
 export default {
-  async scheduled(event, env, ctx) { ctx.waitUntil(flushPending(env)); },
+  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
   async fetch(req, env) {
     const url = new URL(req.url), origin = req.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean), okOrigin = allowed.includes(origin);
@@ -393,7 +402,7 @@ export class MatchRoom {
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.lastPh = 0; this.lastTk = 0; this.lastZp = 0; this.pAw = 0; this.ranked = false; this.th = 1; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
+    this.lastPh = 0; this.lastTk = 0; this.lastZp = 0; this.pAw = 0; this.ranked = false; this.full = false; this.outAt = 0; this.th = 1; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
   }
 
   genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
@@ -498,6 +507,7 @@ export class MatchRoom {
     if (p.lq > 0) this.offer(p);
   }
   humans() { let n = 0; for (const p of this.players.values()) if (!p.bot) n++; return n; }
+  aliveHumans() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.alive) n++; return n; }
   connected() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.ws) n++; return n; }
   send(ws, arr) { try { if (ws && ws.readyState === 1) { const m = JSON.stringify(arr); this.bytesOut += m.length; ws.send(m); } } catch {} }
 
@@ -587,7 +597,7 @@ export class MatchRoom {
     teams.forEach((t, i) => t.forEach((p) => { p.team = i + 1; }));
     for (const t of teams) for (let i = 1; i < t.length; i++) for (let n = 0; n < 20; n++) { const x = t[0].x + (Math.random() - 0.5) * 300, y = t[0].y + (Math.random() - 0.5) * 300; if (x > 50 && y > 50 && x < 7950 && y < 7950 && !this.hit(x, y, C.R + 10)) { t[i].x = x; t[i].y = y; break; } }
     this.tl = teams; this.teams = teams.length;
-    this.th = teams.filter((t) => t.some((p) => !p.bot)).length; { const acc = hum.filter((p) => p.pid); this.ranked = acc.length >= RK.MIN_ACC && new Set(acc.map((p) => p.ipc)).size >= RK.MIN_NET; } /* ranked only with enough real accounts on different networks */
+    this.th = teams.filter((t) => t.some((p) => !p.bot)).length; { const acc = hum.filter((p) => p.pid); this.full = acc.length >= RK.MIN_ACC && new Set(acc.map((p) => p.ipc)).size >= RK.MIN_NET; this.ranked = this.full || (RK.LITE > 0 && acc.length >= 1); } /* full quorum = real rank + season points; lite = rank only (temporary) */
     for (const p of all) if (p.bot) for (const t of Object.keys(C.BOT_COS)) if (Math.random() < (t === 'flag' || t === 'smoke' ? 0.15 : 0.4)) p.cs[t] = C.BOT_COS[t][Math.floor(Math.random() * C.BOT_COS[t].length)]; // bots wear common items so they look like players
     this.rosterMsg = [6, all.map((p) => [p.id, p.cs.hull || '', p.cs.cannon || '', p.cs.track || '', p.cs.detail || '', p.cs.glow || '', p.cs.bullet || '', p.cs.trail || '', p.cs.blast || '', p.cs.smoke || '', p.cs.flag || ''])]; // cosmetic ids only (no positions): visual info, validated server-side
     for (const p of hum) this.send(p.ws, this.rosterMsg);
@@ -693,6 +703,7 @@ export class MatchRoom {
     const el = (now - this.startAt) / 1000; const z = this.z = this.zoneAt(el); const zp = this.zoneProg(el), dzp = Math.max(0, zp - this.lastZp); this.lastZp = zp;
     const dps = el > C.HARD_CAP_S ? 200 : z.dps;
     if (z.ph !== this.lastPh) { if (this.lastPh) for (const p of this.players.values()) if (p.alive) this.addXp(p, C.PHASE_XP); this.lastPh = z.ph; }
+    if (this.aliveHumans() === 0) { if (!this.outAt) this.outAt = now; else if (now - this.outAt > C.OUT_MS) { this.finish(now, 'out'); return; } } else this.outAt = 0; /* nobody alive to play: stop paying for the room 15 s later */
     if (this.connected() === 0) { if (!this.emptyAt) this.emptyAt = now; else if (now - this.emptyAt > 20000) { this.finish(now, 'empty'); return; } } else this.emptyAt = 0;
     this.gP = this.grid(false); this.rm = [];
     if (now - this.lastNear >= 1000) { this.lastNear = now; this.nearCheck(); }
@@ -757,13 +768,13 @@ export class MatchRoom {
 
   humanOut(team, now) { /* the last living human of a team died: the human-team placement is fixed now and the ranked result is frozen */
     const alive = new Set(); for (const o of this.players.values()) if (!o.bot && o.alive) alive.add(o.team);
-    if (alive.has(team)) return;
-    for (const o of this.players.values()) if (!o.bot && o.team === team && !o.f) { o.hplace = alive.size + 1; this.finalize(o); }
+    if (alive.has(team)) return; const at = new Set(); for (const o of this.players.values()) if (o.alive) at.add(o.team); const lp = at.size + (at.has(team) ? 0 : 1); /* overall placement right now (lite rank) */
+    for (const o of this.players.values()) if (!o.bot && o.team === team && !o.f) { o.hplace = alive.size + 1; o.lp = lp; this.finalize(o); }
   }
-  finalize(o) { const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid); o.f = { sc, rk, hp: o.hplace || 1, rp: rk ? rankDelta({ ranked: true, th: this.th, ph: o.hplace || 1, kills: o.hk, score: sc, engaged: o.dmgHum >= 100 || o.hk > 0 || o.assists > 0, mode: this.mode }) : 0 }; }
+  finalize(o) { const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid), sp = rk && this.full; let rp = 0; if (rk) rp = this.full ? rankDelta({ ranked: true, th: this.th, ph: o.hplace || 1, kills: o.hk, score: sc, engaged: o.dmgHum >= 100 || o.hk > 0 || o.assists > 0, mode: this.mode }) : liteDelta(o.lp || o.place || 1, this.teams); o.f = { sc, rk, sp, hp: o.hplace || 1, rp }; }
   zoneProg(el) { /* 0..5: how far the zone sequence has progressed (each phase counts 1, fractions inside a phase) */ let t = el; for (let i = 0; i < C.PHASES.length; i++) { const d = C.PHASES[i][0] + C.PHASES[i][1]; if (t < d) return i + t / d; t -= d; } return C.PHASES.length; }
   score(p) { /* MATCH SCORE: starts at 30; every source is capped (zone 25, kills 10, damage 8, assists 6, placement 17 => max 96) */ return Math.min(100, 30 + Math.min(25, p.zs) + Math.min(10, p.ksc) + Math.min(8, p.dmgS / 125) + Math.min(6, p.asc) + Math.min(17, p.ps)); }
-  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0]; }
+  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0, o.f && o.f.sp ? 1 : 0]; }
   specOf(h) { /* dead player in duo/squad: follow a living teammate (shows exactly what that teammate already sees) */
     const l = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h && m.alive) l.push(m);
     if (!l.length) return null;
@@ -790,9 +801,13 @@ export class MatchRoom {
 
   finish(now, reason) {
     this.state = 'ended'; this.endAt = now; if (reason === 'last') for (const p of this.players.values()) if (!p.bot && p.place === 1) p.ps += 5; /* winner bonus */
-    for (const p of this.players.values()) if (!p.bot && !p.f) { if (!p.hplace) p.hplace = 1; this.finalize(p); } /* survivors and winners get their ranked result now */
+    if (reason === 'empty' || reason === 'out') { /* the room was abandoned: nobody WINS by leaving. A human still alive at that moment gets the worst placement. */
+      const at = new Set(); for (const o of this.players.values()) if (o.alive) at.add(o.team);
+      for (const p of this.players.values()) if (!p.bot) { if (p.alive) { p.place = this.teams; p.hplace = this.th; p.lp = this.teams; } else if (at.has(p.team)) { p.place = at.size; p.lp = at.size; } }
+    }
+    for (const p of this.players.values()) if (!p.bot && !p.f) { if (!p.hplace) p.hplace = 1; if (!p.lp) p.lp = p.place || 1; this.finalize(p); } /* survivors and winners get their ranked result now */
     const s = this.stats();
-    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams, p.f ? p.f.sc : Math.round(this.score(p)), p.f ? p.f.rp : 0, p.f && p.f.rk ? 1 : 0]); }
+    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams, p.f ? p.f.sc : Math.round(this.score(p)), p.f ? p.f.rp : 0, p.f && p.f.rk ? 1 : 0, p.f && p.f.sp ? 1 : 0]); }
     for (const p of this.players.values()) if (p.ws) p.ws._t0 = now;
     console.log(JSON.stringify({ ev: 'end', reason, ...s, suspicious: this.susp.length }));
     const hum = [...this.players.values()].filter((p) => !p.bot);
@@ -826,7 +841,7 @@ export class MatchRoom {
   tm(h) { const o = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h) o.push([m.id, m.x | 0, m.y | 0, m.alive ? 1 : 0]); return o; } // teammates only (minimap + markers)
   async persist(now, hum) { // ONE atomic, idempotent RPC at match end (zero writes during the match)
     const byId = new Map(hum.map((p) => [p.id, p]));
-    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills), match_score: p.f ? p.f.sc : null, rp_delta: p.f ? p.f.rp : 0, ranked: !!(p.f && p.f.rk), hplace: p.f ? p.f.hp : null }));
+    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills), match_score: p.f ? p.f.sc : null, rp_delta: p.f ? p.f.rp : 0, ranked: !!(p.f && p.f.rk), sp_ok: !!(p.f && p.f.sp), hplace: p.f ? p.f.hp : null }));
     if (!mp.length) return; // guests are never persisted
     const sl = this.flags(now, hum); // evidence rows for suspicion_logs (flag + log only: no automatic bans from statistics)
     const iso = (t) => new Date(t).toISOString();
