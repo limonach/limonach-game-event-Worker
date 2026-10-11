@@ -75,6 +75,16 @@ async function flushPending(env) { // retry end-of-match writes that failed (ide
   const l = await env.RL.list({ prefix: 'rbr:pend:', limit: 20 });
   for (const k of l.keys) { const v = await env.RL.get(k.name); if (!v) continue; try { const r = await sb(env, 'rpc/finish_match', { method: 'POST', body: v }); if (r.ok) await env.RL.delete(k.name); } catch {} }
 }
+const RK = { MIN_ACC: 8, MIN_NET: 6, FIELD_MIN: 5, FULL_TH: 6, /* TUNE: ranked needs 8+ real accounts from 6+ different networks; placement is measured among HUMAN teams only */
+  KNOTS: [[0, 35], [0.0196, 30], [0.039, 27], [0.059, 24], [0.078, 21], [0.098, 15], [0.176, 5], [0.196, 0], [0.372, -10], [0.392, -15], [0.569, -15], [0.588, -20], [0.765, -20], [0.784, -25], [1, -25]] }; /* placement points by percentile (your solo table, stretched to any number of teams) */
+function rankDelta(o) { /* RP change of ONE human for ONE match. o = { ranked, th (human teams), ph (human-team place), kills (HUMAN kills only), score, engaged, mode } */
+  if (!o.ranked) return 0;
+  const x = o.th > 1 ? Math.min(1, (o.ph - 1) / Math.max(o.th - 1, RK.FIELD_MIN)) : 0; let pp = 0;
+  for (let i = 1; i < RK.KNOTS.length; i++) { const a = RK.KNOTS[i - 1], b = RK.KNOTS[i]; if (x <= b[0]) { pp = a[1] + (b[1] - a[1]) * ((x - a[0]) / (b[0] - a[0])); break; } }
+  if (pp > 0) { pp *= Math.min(1, o.th / RK.FULL_TH); if (o.mode !== 'solo') pp *= Math.min(1, Math.max(0.5, o.score / 60)); } /* small fields pay less; in duo/squad a carried teammate gets less */
+  const kp = Math.min(10, 2 * o.kills), bonus = o.engaged ? (o.score >= 81 ? 30 : o.score >= 60 ? 20 : 0) : 0; /* score bonus only if you actually fought a human */
+  return Math.max(-30, Math.min(80, Math.round(pp + kp + bonus)));
+}
 const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
 const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
 
@@ -177,6 +187,22 @@ export default {
         const j = await r.json(); if (j.ok) return J(j, 200, cors);
         return J({ e: j.e || 'err' }, j.e === 'dup' || j.e === 'noad' ? 409 : 404, cors);
       }
+      if (P === '/ranked' || P === '/sp/gems' || P === '/sp/withdraw') { /* season rank + season points store (no money moves here: withdrawals are only REQUESTS reviewed by the owner) */
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        if (P === '/ranked' && req.method === 'GET') {
+          const r = await sb(env, 'rpc/get_ranked', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) });
+          if (!r.ok) { console.log('ranked_db', r.status); return J({ e: 'err' }, 502, cors); }
+          const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
+        }
+        if (req.method !== 'POST' || P === '/ranked') return new Response(null, { status: 405 });
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'sp') || !Number.isInteger(b.sp) || b.sp < 1 || b.sp > 10000000) return J({ e: 'bad' }, 400, cors);
+        const r = await sb(env, 'rpc/' + (P === '/sp/gems' ? 'sp_buy_gems' : 'sp_withdraw'), { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid, sp: b.sp } }) });
+        if (!r.ok) { console.log('sp_db', r.status); return J({ e: 'err' }, 502, cors); }
+        const j = await r.json(); if (j.ok) return J(j, 200, cors);
+        return J({ e: j.e || 'err' }, j.e === 'bad' ? 400 : j.e === 'player' ? 404 : 409, cors);
+      }
       if (P === '/resume' && req.method === 'GET') { // returning after a page reload: is the player still inside a live match?
         if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
         const [st, j] = await mmCall(env, '/active', { u: ses.u }); if (st !== 200 || !j.m || !UUID.test(j.m) || !K.TEAM[j.md]) return J({ r: 0 }, 200, cors);
@@ -193,8 +219,8 @@ export default {
         if (req.method !== 'GET') return new Response(null, { status: 405 });
         if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
         if (P === '/leaderboard') { // top 50 by total XP, cached 2 min in KV (one DB read per 2 min no matter how many players ask)
-          let lb = await env.RL.get('rbr:lb');
-          if (!lb) { const r = await sb(env, 'players?select=name,level,total_xp&banned=eq.false&total_xp=gt.0&order=total_xp.desc&limit=50'); if (!r.ok) return J({ e: 'err' }, 502, cors); lb = JSON.stringify((await r.json()).map((x) => [String(x.name).slice(0, 24), x.level | 0, Number(x.total_xp) || 0])); await env.RL.put('rbr:lb', lb, { expirationTtl: 120 }); }
+          let lb = await env.RL.get('rbr:lb2');
+          if (!lb) { const r = await sb(env, 'rpc/get_top', { method: 'POST', body: JSON.stringify({ p: {} }) }); if (!r.ok) return J({ e: 'err' }, 502, cors); const j = await r.json(); lb = JSON.stringify(Array.isArray(j) ? j.map((x) => [String(x[0]).slice(0, 24), Number(x[1]) || 0]) : []); await env.RL.put('rbr:lb2', lb, { expirationTtl: 120 }); }
           return J({ top: JSON.parse(lb) }, 200, cors);
         }
         if (!ses.pid) return J({ e: 'guest' }, 403, cors);
@@ -367,7 +393,7 @@ export class MatchRoom {
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.lastPh = 0; this.lastTk = 0; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
+    this.lastPh = 0; this.lastTk = 0; this.lastZp = 0; this.pAw = 0; this.ranked = false; this.th = 1; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
   }
 
   genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
@@ -433,7 +459,7 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', cs: {}, skill: 0.6 + Math.random() * 0.4, aggr: Math.random(), tgt: 0, tgtAt: 0, side: 1, sideAt: 0, idleUntil: 0, ssd: 1, forceRoam: 0, skip: 0, skipUntil: 0, stuckN: 0, want: 0, cur: 0, chkAt: 0, cx: 0, cy: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0 };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', cs: {}, skill: 0.6 + Math.random() * 0.4, aggr: Math.random(), tgt: 0, tgtAt: 0, side: 1, sideAt: 0, idleUntil: 0, ssd: 1, forceRoam: 0, skip: 0, skipUntil: 0, stuckN: 0, want: 0, cur: 0, chkAt: 0, cx: 0, cy: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0, zs: 0, ksc: 0, asc: 0, ps: 0, dmgS: 0, hk: 0, dmgHum: 0, hplace: 0, f: null };
     this.players.set(p.id, p); return p;
   }
 
@@ -561,6 +587,7 @@ export class MatchRoom {
     teams.forEach((t, i) => t.forEach((p) => { p.team = i + 1; }));
     for (const t of teams) for (let i = 1; i < t.length; i++) for (let n = 0; n < 20; n++) { const x = t[0].x + (Math.random() - 0.5) * 300, y = t[0].y + (Math.random() - 0.5) * 300; if (x > 50 && y > 50 && x < 7950 && y < 7950 && !this.hit(x, y, C.R + 10)) { t[i].x = x; t[i].y = y; break; } }
     this.tl = teams; this.teams = teams.length;
+    this.th = teams.filter((t) => t.some((p) => !p.bot)).length; { const acc = hum.filter((p) => p.pid); this.ranked = acc.length >= RK.MIN_ACC && new Set(acc.map((p) => p.ipc)).size >= RK.MIN_NET; } /* ranked only with enough real accounts on different networks */
     for (const p of all) if (p.bot) for (const t of Object.keys(C.BOT_COS)) if (Math.random() < (t === 'flag' || t === 'smoke' ? 0.15 : 0.4)) p.cs[t] = C.BOT_COS[t][Math.floor(Math.random() * C.BOT_COS[t].length)]; // bots wear common items so they look like players
     this.rosterMsg = [6, all.map((p) => [p.id, p.cs.hull || '', p.cs.cannon || '', p.cs.track || '', p.cs.detail || '', p.cs.glow || '', p.cs.bullet || '', p.cs.trail || '', p.cs.blast || '', p.cs.smoke || '', p.cs.flag || ''])]; // cosmetic ids only (no positions): visual info, validated server-side
     for (const p of hum) this.send(p.ws, this.rosterMsg);
@@ -628,19 +655,19 @@ export class MatchRoom {
   kill(p, now) {
     if (!p.alive) return;
     p.alive = false; p.hp = 0; p.fire = 0; p.mx = 0; p.my = 0;
-    p.dieAt = now; const at = new Set(); for (const o of this.players.values()) if (o.alive) at.add(o.team);
+    p.dieAt = now; if (!p.bot) this.humanOut(p.team, now); const at = new Set(); for (const o of this.players.values()) if (o.alive) at.add(o.team);
     p.place = at.size + 1; // team placement: set for the whole team once its last member dies
     const teamOut = !at.has(p.team);
     if (teamOut) { const us = []; for (const o of this.players.values()) if (o.team === p.team) { o.place = at.size + 1; if (!o.bot) { us.push(o.gid); if (o !== p) this.send(o.ws, this.res(o, 1, now)); } } if (us.length) this.mm('/out', { m: this.mid, us }); }
     const k = this.players.get(p.killer); if (k && k !== p) {
-      k.kills++;
+      k.kills++; k.ksc += p.bot ? 2 : 4; if (!p.bot) k.hk++; /* match score: human kill +4, bot kill +2 */
       if (!k.bot) { let xp; if (p.bot) xp = C.BOT_KILL_XP; else { xp = 80 + 25 * p.lvl; if (k.lvl - p.lvl >= 3) xp *= 0.6; else if (p.lvl - k.lvl >= 2) xp *= 1.5; } this.addXp(k, Math.round(xp)); }
     }
     this.addLoot(6, p.x, p.y, 60); // death crate (+60 XP)
     { // assist: >=25% of victim max HP dealt by someone else within the last 5s -> 40% of base kill XP
       const kx = p.bot ? C.BOT_KILL_XP : 80 + 25 * p.lvl, tot = new Map();
       for (const x of p.dl) if (now - x.t <= 5000) tot.set(x.by, (tot.get(x.by) || 0) + x.d);
-      for (const [id, d] of tot) { const a = this.players.get(id); if (a && a !== k && a !== p && d >= 0.25 * p.maxHp) { this.addXp(a, Math.round(0.4 * kx)); a.assists = (a.assists || 0) + 1; } }
+      for (const [id, d] of tot) { const a = this.players.get(id); if (a && a !== k && a !== p && d >= 0.25 * p.maxHp) { this.addXp(a, Math.round(0.4 * kx)); a.assists = (a.assists || 0) + 1; a.asc += 2; } }
     }
     this.send(p.ws, this.res(p, teamOut ? 1 : 0, now));
   }
@@ -663,7 +690,7 @@ export class MatchRoom {
       return;
     }
     // running
-    const el = (now - this.startAt) / 1000; const z = this.z = this.zoneAt(el);
+    const el = (now - this.startAt) / 1000; const z = this.z = this.zoneAt(el); const zp = this.zoneProg(el), dzp = Math.max(0, zp - this.lastZp); this.lastZp = zp;
     const dps = el > C.HARD_CAP_S ? 200 : z.dps;
     if (z.ph !== this.lastPh) { if (this.lastPh) for (const p of this.players.values()) if (p.alive) this.addXp(p, C.PHASE_XP); this.lastPh = z.ph; }
     if (this.connected() === 0) { if (!this.emptyAt) this.emptyAt = now; else if (now - this.emptyAt > 20000) { this.finish(now, 'empty'); return; } } else this.emptyAt = 0;
@@ -696,7 +723,7 @@ export class MatchRoom {
           this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, man: man ? 1 : 0, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
         }
       }
-      if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; }
+      if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; } else if (!p.bot) p.zs += 5 * dzp; /* match score: zone points grow gradually, only while alive INSIDE the safe zone */
     }
     for (const it of this.rm) this.removeLoot(it);
     // bullets (3 substeps, vs walls and players)
@@ -709,7 +736,7 @@ export class MatchRoom {
         this.q(this.gP, b.x, b.y, 30, (e) => {
           if (dead || e.id === b.o || !e.alive || e.team === b.tm) return; // friendly fire off
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
-            dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG * (e.bot ? C.BOT_VS_BOT : 1) : 1) : 1); /* bots hit softer, and softer still against other bots */ if (o) { o.dmg += dm; if (b.man) o.hits++; } this.hurt(e, dm, b.o, now);
+            dead = true; const o = this.players.get(b.o), dm = b.dm * (o ? (1 + 0.12 * o.b[0]) * (o.bot ? C.BOT_DMG * (e.bot ? C.BOT_VS_BOT : 1) : 1) : 1); /* bots hit softer, and softer still against other bots */ if (o) { o.dmg += dm; o.dmgS += e.bot ? dm * 0.5 : dm; if (!e.bot) o.dmgHum += dm; if (b.man) o.hits++; } this.hurt(e, dm, b.o, now);
           }
         });
       }
@@ -719,6 +746,8 @@ export class MatchRoom {
     this.bullets = keep;
     for (const p of this.players.values()) if (p.alive && p.hp <= 0) this.kill(p, now);
     let alive = 0; const ta = new Set(); for (const p of this.players.values()) if (p.alive) { alive++; ta.add(p.team); }
+    { const T = this.teams, thr = [Math.ceil(T * 0.4), Math.ceil(T * 0.2), Math.ceil(T * 0.1)], val = [3, 4, 5]; /* placement points when the number of living teams falls to 40% / 20% / 10% of the start */
+      while (this.pAw < 3 && ta.size <= thr[this.pAw]) { const v = val[this.pAw]; for (const p of this.players.values()) if (!p.bot && p.alive) p.ps += v; this.pAw++; } }
     if (ta.size <= 1 || el > C.HARD_CAP_S + 15) { for (const p of this.players.values()) if (ta.has(p.team)) p.place = 1; this.finish(now, ta.size <= 1 ? 'last' : 'cap'); return; }
     if (this.tickN % C.SNAP_EVERY === 0) {
       const gAll = this.grid(true), zArr = [z.cx | 0, z.cy | 0, z.r | 0, z.tcx | 0, z.tcy | 0, z.tr | 0, Math.ceil(z.left), z.ph, z.dps, z.shrink];
@@ -726,7 +755,15 @@ export class MatchRoom {
     }
   }
 
-  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams]; }
+  humanOut(team, now) { /* the last living human of a team died: the human-team placement is fixed now and the ranked result is frozen */
+    const alive = new Set(); for (const o of this.players.values()) if (!o.bot && o.alive) alive.add(o.team);
+    if (alive.has(team)) return;
+    for (const o of this.players.values()) if (!o.bot && o.team === team && !o.f) { o.hplace = alive.size + 1; this.finalize(o); }
+  }
+  finalize(o) { const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid); o.f = { sc, rk, hp: o.hplace || 1, rp: rk ? rankDelta({ ranked: true, th: this.th, ph: o.hplace || 1, kills: o.hk, score: sc, engaged: o.dmgHum >= 100 || o.hk > 0 || o.assists > 0, mode: this.mode }) : 0 }; }
+  zoneProg(el) { /* 0..5: how far the zone sequence has progressed (each phase counts 1, fractions inside a phase) */ let t = el; for (let i = 0; i < C.PHASES.length; i++) { const d = C.PHASES[i][0] + C.PHASES[i][1]; if (t < d) return i + t / d; t -= d; } return C.PHASES.length; }
+  score(p) { /* MATCH SCORE: starts at 30; every source is capped (zone 25, kills 10, damage 8, assists 6, placement 17 => max 96) */ return Math.min(100, 30 + Math.min(25, p.zs) + Math.min(10, p.ksc) + Math.min(8, p.dmgS / 125) + Math.min(6, p.asc) + Math.min(17, p.ps)); }
+  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0]; }
   specOf(h) { /* dead player in duo/squad: follow a living teammate (shows exactly what that teammate already sees) */
     const l = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h && m.alive) l.push(m);
     if (!l.length) return null;
@@ -748,13 +785,14 @@ export class MatchRoom {
       }
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w * 3 + h.wr], P, B, G, zArr, alive, el | 0, L, this.tm(h)]);
+    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w * 3 + h.wr, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h)]);
   }
 
   finish(now, reason) {
-    this.state = 'ended'; this.endAt = now;
+    this.state = 'ended'; this.endAt = now; if (reason === 'last') for (const p of this.players.values()) if (!p.bot && p.place === 1) p.ps += 5; /* winner bonus */
+    for (const p of this.players.values()) if (!p.bot && !p.f) { if (!p.hplace) p.hplace = 1; this.finalize(p); } /* survivors and winners get their ranked result now */
     const s = this.stats();
-    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams]); }
+    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams, p.f ? p.f.sc : Math.round(this.score(p)), p.f ? p.f.rp : 0, p.f && p.f.rk ? 1 : 0]); }
     for (const p of this.players.values()) if (p.ws) p.ws._t0 = now;
     console.log(JSON.stringify({ ev: 'end', reason, ...s, suspicious: this.susp.length }));
     const hum = [...this.players.values()].filter((p) => !p.bot);
@@ -788,7 +826,7 @@ export class MatchRoom {
   tm(h) { const o = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h) o.push([m.id, m.x | 0, m.y | 0, m.alive ? 1 : 0]); return o; } // teammates only (minimap + markers)
   async persist(now, hum) { // ONE atomic, idempotent RPC at match end (zero writes during the match)
     const byId = new Map(hum.map((p) => [p.id, p]));
-    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills) }));
+    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills), match_score: p.f ? p.f.sc : null, rp_delta: p.f ? p.f.rp : 0, ranked: !!(p.f && p.f.rk), hplace: p.f ? p.f.hp : null }));
     if (!mp.length) return; // guests are never persisted
     const sl = this.flags(now, hum); // evidence rows for suspicion_logs (flag + log only: no automatic bans from statistics)
     const iso = (t) => new Date(t).toISOString();
