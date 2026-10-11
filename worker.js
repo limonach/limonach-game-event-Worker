@@ -34,7 +34,8 @@ const sign = async (secret, data) => b64u(await crypto.subtle.sign('HMAC', await
 const verify = async (secret, data, sig) => { try { return await crypto.subtle.verify('HMAC', await hkey(secret, 'verify'), unb64u(sig), enc.encode(data)); } catch { return false; } };
 const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
 const J = (o, s, h) => new Response(JSON.stringify(o), { status: s || 200, headers: { 'content-type': 'application/json', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store', ...(h || {}) } });
-const reward = (place, kills) => 20 + kills * 15 + (place === 1 ? 150 : place <= 3 ? 75 : place <= 10 ? 30 : 0); // TUNE: soft currency per match (server-side only; SQL also caps it)
+const PCOINS = [150, 125, 110, 100, 90, 80, 70, 65, 60, 55, 50, 45, 40, 35]; /* coins by team placement 1..14, then 15-20: 30, 21-30: 20, 31-40: 15, 41-52: 10 */
+const reward = (place, kills, score) => (place <= 14 ? PCOINS[Math.max(1, place) - 1] : place <= 20 ? 30 : place <= 30 ? 20 : place <= 40 ? 15 : 10) + kills * 15 + (score >= 80 ? 50 : 0); // TUNE: coins per match = placement table + 15 per kill + 50 if MATCH SCORE >= 80 (server-side only; SQL also caps it at 1000)
 
 // Signed tokens: base64url(json) + '.' + HMAC(domain + payload). Domains separate session tokens (S1.) from match-join tokens (J1.).
 async function mkTok(env, dom, obj) { const p = b64u(enc.encode(JSON.stringify(obj))); return p + '.' + (await sign(env.JOIN_SECRET, dom + p)); }
@@ -116,8 +117,10 @@ export default {
         const uid = url.searchParams.get('userid') || '', kk = url.searchParams.get('k') || '';
         if (!env.ADSGRAM_SECRET || !teq(kk, env.ADSGRAM_SECRET)) return new Response(null, { status: 404 });
         if (!/^[0-9]{1,15}$/.test(uid)) return J({ e: 'bad' }, 400);
+        const kind = url.searchParams.get('b') || 'daily'; /* which AdsGram block was watched: daily | x2 | gem (no b = the old daily URL) */
+        if (kind !== 'daily' && kind !== 'x2' && kind !== 'gem') return J({ e: 'bad' }, 400);
         if (!(await rl(env, 'adr:' + uid, 10))) return J({ e: 'slow' }, 429);
-        const r = await sb(env, 'rpc/add_ad_credit', { method: 'POST', body: JSON.stringify({ p: { tid: Number(uid) } }) });
+        const r = await sb(env, 'rpc/add_ad_credit', { method: 'POST', body: JSON.stringify({ p: { tid: Number(uid), kind } }) });
         if (!r.ok) { console.log('adr_db', r.status); return J({ e: 'err' }, 502); }
         return J({ ok: 1 });
       }
@@ -211,6 +214,25 @@ export default {
         if (!r.ok) { console.log('sp_db', r.status); return J({ e: 'err' }, 502, cors); }
         const j = await r.json(); if (j.ok) return J(j, 200, cors);
         return J({ e: j.e || 'err' }, j.e === 'bad' ? 400 : j.e === 'player' ? 404 : 409, cors);
+      }
+      if (P === '/gemad' || P === '/gemad/claim' || P === '/match/double') { /* free-gem ad in the shop (1 GEM, 5/day, 5 min cooldown) and DOUBLE COINS after a match: both need a server-verified AdsGram credit of their own kind */
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        if (P === '/gemad' && req.method === 'GET') {
+          const r = await sb(env, 'rpc/get_gemad', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) });
+          if (!r.ok) { console.log('gemad_db', r.status); return J({ e: 'err' }, 502, cors); }
+          const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
+        }
+        if (req.method !== 'POST' || P === '/gemad') return new Response(null, { status: 405 });
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || !Number.isSafeInteger(ses.tid)) return J({ e: Number.isSafeInteger(ses.tid) ? 'bad' : 'auth' }, Number.isSafeInteger(ses.tid) ? 400 : 401, cors);
+        let call;
+        if (P === '/gemad/claim') { if (Object.keys(b).length) return J({ e: 'bad' }, 400, cors); call = ['claim_gem_ad', { pid: ses.pid, tid: ses.tid }]; }
+        else { if (Object.keys(b).some((k) => k !== 'm') || typeof b.m !== 'string' || !UUID.test(b.m)) return J({ e: 'bad' }, 400, cors); call = ['double_match', { pid: ses.pid, tid: ses.tid, m: b.m }]; }
+        const r = await sb(env, 'rpc/' + call[0], { method: 'POST', body: JSON.stringify({ p: call[1] }) });
+        if (!r.ok) { console.log('ad_claim_db', r.status); return J({ e: 'err' }, 502, cors); }
+        const j = await r.json(); if (j.ok) return J(j, 200, cors);
+        return J(j.e === 'cool' ? { e: 'cool', wait: j.wait | 0 } : { e: j.e || 'err' }, j.e === 'bad' ? 400 : j.e === 'player' ? 404 : 409, cors);
       }
       if (P === '/resume' && req.method === 'GET') { // returning after a page reload: is the player still inside a live match?
         if (!(await rl(env, 'stats:' + ses.u, K.RL.stats))) return J({ e: 'slow' }, 429, cors);
@@ -774,7 +796,7 @@ export class MatchRoom {
   finalize(o) { const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid), sp = rk && this.full; let rp = 0; if (rk) rp = this.full ? rankDelta({ ranked: true, th: this.th, ph: o.hplace || 1, kills: o.hk, score: sc, engaged: o.dmgHum >= 100 || o.hk > 0 || o.assists > 0, mode: this.mode }) : liteDelta(o.lp || o.place || 1, this.teams); o.f = { sc, rk, sp, hp: o.hplace || 1, rp }; }
   zoneProg(el) { /* 0..5: how far the zone sequence has progressed (each phase counts 1, fractions inside a phase) */ let t = el; for (let i = 0; i < C.PHASES.length; i++) { const d = C.PHASES[i][0] + C.PHASES[i][1]; if (t < d) return i + t / d; t -= d; } return C.PHASES.length; }
   score(p) { /* MATCH SCORE: starts at 30; every source is capped (zone 25, kills 10, damage 8, assists 6, placement 17 => max 96) */ return Math.min(100, 30 + Math.min(25, p.zs) + Math.min(10, p.ksc) + Math.min(8, p.dmgS / 125) + Math.min(6, p.asc) + Math.min(17, p.ps)); }
-  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0, o.f && o.f.sp ? 1 : 0]; }
+  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills, o.f ? o.f.sc : Math.round(this.score(o))), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0, o.f && o.f.sp ? 1 : 0]; }
   specOf(h) { /* dead player in duo/squad: follow a living teammate (shows exactly what that teammate already sees) */
     const l = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h && m.alive) l.push(m);
     if (!l.length) return null;
@@ -807,7 +829,7 @@ export class MatchRoom {
     }
     for (const p of this.players.values()) if (!p.bot && !p.f) { if (!p.hplace) p.hplace = 1; if (!p.lp) p.lp = p.place || 1; this.finalize(p); } /* survivors and winners get their ranked result now */
     const s = this.stats();
-    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams, p.f ? p.f.sc : Math.round(this.score(p)), p.f ? p.f.rp : 0, p.f && p.f.rk ? 1 : 0, p.f && p.f.sp ? 1 : 0]); }
+    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills, p.f ? p.f.sc : Math.round(this.score(p))), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams, p.f ? p.f.sc : Math.round(this.score(p)), p.f ? p.f.rp : 0, p.f && p.f.rk ? 1 : 0, p.f && p.f.sp ? 1 : 0]); }
     for (const p of this.players.values()) if (p.ws) p.ws._t0 = now;
     console.log(JSON.stringify({ ev: 'end', reason, ...s, suspicious: this.susp.length }));
     const hum = [...this.players.values()].filter((p) => !p.bot);
@@ -841,7 +863,7 @@ export class MatchRoom {
   tm(h) { const o = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h) o.push([m.id, m.x | 0, m.y | 0, m.alive ? 1 : 0]); return o; } // teammates only (minimap + markers)
   async persist(now, hum) { // ONE atomic, idempotent RPC at match end (zero writes during the match)
     const byId = new Map(hum.map((p) => [p.id, p]));
-    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills), match_score: p.f ? p.f.sc : null, rp_delta: p.f ? p.f.rp : 0, ranked: !!(p.f && p.f.rk), sp_ok: !!(p.f && p.f.sp), hplace: p.f ? p.f.hp : null }));
+    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills, p.f ? p.f.sc : Math.round(this.score(p))), match_score: p.f ? p.f.sc : null, rp_delta: p.f ? p.f.rp : 0, ranked: !!(p.f && p.f.rk), sp_ok: !!(p.f && p.f.sp), hplace: p.f ? p.f.hp : null }));
     if (!mp.length) return; // guests are never persisted
     const sl = this.flags(now, hum); // evidence rows for suspicion_logs (flag + log only: no automatic bans from statistics)
     const iso = (t) => new Date(t).toISOString();
