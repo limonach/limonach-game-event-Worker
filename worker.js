@@ -185,11 +185,152 @@ async function payPending(env) { // cron: retry pending withdrawals (10 at a tim
   for (const w of await r.json()) { try { await payWithdrawal(env, { id: w.id, pid: w.player_id, tid: w.players && w.players.telegram_id, usd: Number(w.usd) }); } catch (e) { console.log('pay_err', String(e && e.message)); } }
 }
 async function autoRotate(env) { try { const r = await sb(env, 'rpc/auto_rotate_season', { method: 'POST', body: '{}' }); if (!r.ok) console.log('rotate_db', r.status); } catch (e) { console.log('rotate_err'); } }
+
+// ---------- Telegram Stars (XTR): digital goods paid inside Telegram ----------
+// Flow: client sends only { pack } -> Worker reads the price HERE -> createInvoiceLink -> Mini App openInvoice -> Telegram webhook (pre_checkout_query, successful_payment, secret-token protected)
+// -> D1 star_orders (PENDING -> PAID -> DELIVERED) -> Supabase credit_gem_order (idempotent by order id). Refunds only through the official refundStarPayment method; they are RECORDED, nothing is reserved.
+const STAR_PRICES = [99, 299, 499, 999, 1999, 4999]; // TUNE: Stars per pack, same index as GEM_PACKS (100 Stars = 1 USD of in-game value). The ONLY place prices exist; the client never sends a price.
+const SO_ID = /^s[0-9a-f]{24}$/;
+const TERMS_TEXT = 'Robot BR - Terms of Service and Refund Policy\n\n1. GEM is a virtual in-game currency sold as a digital product. It has no cash value and cannot be withdrawn, sold or transferred.\n2. Payment is made in Telegram Stars (or in USDT through xRocket where offered). The purchase is delivered automatically after the payment is confirmed.\n3. Refunds: send /paysupport with your Order ID. Mistaken or undelivered purchases are refunded. If the purchased GEM were already spent, the refund may be declined.\n4. Telegram support cannot help with purchases made in this game.\n5. Telegram Stars terms: https://telegram.org/tos/stars';
+const tgApi = async (env, method, body) => { // never logs the URL (it contains the bot token)
+  if (!env.TELEGRAM_BOT_TOKEN) return { s: 0, j: {} };
+  try {
+    const r = await fetch('https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/' + method, { method: 'POST', signal: AbortSignal.timeout(8000), headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    let j = {}; try { j = await r.json(); } catch {} return { s: r.status, j };
+  } catch (e) { console.log('tg_net', method); return { s: 0, j: {} }; }
+};
+async function buyStars(env, ses, pack, cors) {
+  if (!env.DB || !env.TELEGRAM_BOT_TOKEN || !env.TG_WEBHOOK_SECRET || !Number.isSafeInteger(ses.tid)) return J({ e: 'pay' }, 503, cors);
+  const now = Date.now(), pk = GEM_PACKS[pack], stars = STAR_PRICES[pack];
+  const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM star_orders WHERE pid = ?1 AND status = 'PENDING' AND created_at > ?2").bind(ses.pid, now - 3600000).first();
+  if (n && n.n >= XR.MAX_PENDING) return J({ e: 'slow' }, 429, cors); /* abuse: invoice spam */
+  const oid = 's' + hex(12);
+  await env.DB.prepare("INSERT INTO star_orders (order_id, tid, pid, pack, gems, stars, usd_cents, currency, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'XTR', 'PENDING', ?8, ?8)").bind(oid, ses.tid, ses.pid, pack, pk[0], stars, pk[1], now).run();
+  const r = await tgApi(env, 'createInvoiceLink', { title: pk[0] + ' GEM', description: 'In-game digital currency: ' + pk[0] + ' GEM', payload: oid, currency: 'XTR', prices: [{ label: pk[0] + ' GEM', amount: stars }] }); /* no provider_token for Stars */
+  if (!(r.j && r.j.ok === true && typeof r.j.result === 'string' && r.j.result.startsWith('https://t.me/'))) { console.log('tg_invoice_fail', r.s, String((r.j && r.j.description) || '').slice(0, 80)); await env.DB.prepare("UPDATE star_orders SET status = 'CANCELLED', updated_at = ?2 WHERE order_id = ?1").bind(oid, Date.now()).run(); return J({ e: 'err' }, 502, cors); }
+  return J({ ok: 1, url: r.j.result, stars }, 200, cors);
+}
+async function tgPre(env, q) { // must answer within 10 s: one D1 read + one Supabase read
+  const deny = (m) => tgApi(env, 'answerPreCheckoutQuery', { pre_checkout_query_id: q.id, ok: false, error_message: m });
+  try {
+    const o = typeof q.invoice_payload === 'string' && SO_ID.test(q.invoice_payload) ? await env.DB.prepare('SELECT * FROM star_orders WHERE order_id = ?1').bind(q.invoice_payload).first() : null;
+    if (!o || o.status !== 'PENDING' || !q.from || o.tid !== q.from.id || q.currency !== 'XTR' || q.total_amount !== o.stars || Date.now() - o.created_at > 86400000) return deny('This order is not valid any more. Please open the shop again.');
+    const r = await sb(env, 'players?id=eq.' + o.pid + '&select=banned'); if (!r.ok) return deny('Temporary error, please try again.'); /* fail closed */
+    const p = (await r.json())[0]; if (!p || p.banned) return deny('This account cannot make purchases.');
+    return tgApi(env, 'answerPreCheckoutQuery', { pre_checkout_query_id: q.id, ok: true });
+  } catch (e) { console.log('tg_pre_err', String(e && e.message)); return deny('Temporary error, please try again.'); }
+}
+async function tgDeliver(env, o) { /* idempotent: credit_gem_order dedupes on the order id */
+  const r = await sb(env, 'rpc/credit_gem_order', { method: 'POST', body: JSON.stringify({ p: { ref: o.order_id, pid: o.pid, gems: o.gems, usd: o.usd_cents, src: 'stars' } }) });
+  if (!r.ok) { console.log('tg_deliver_db', r.status); return false; }
+  const j = await r.json(); if (!j || (!j.ok && !j.dup)) { console.log('tg_deliver_rej', j && j.e); return false; }
+  await env.DB.prepare("UPDATE star_orders SET status = 'DELIVERED', delivered_at = ?2, updated_at = ?2 WHERE order_id = ?1 AND status = 'PAID'").bind(o.order_id, Date.now()).run();
+  return true;
+}
+async function tgPaid(env, m) {
+  const sp = m.successful_payment, f = m.from || {}, oid = sp.invoice_payload, ch = sp.telegram_payment_charge_id, db = env.DB, now = Date.now();
+  if (typeof oid !== 'string' || !SO_ID.test(oid) || typeof ch !== 'string' || !ch || ch.length > 200) { console.log('tg_paid_badpayload'); return J({ ok: 1 }); }
+  const led = (type, stars, note) => db.prepare('INSERT OR IGNORE INTO star_ledger (order_id, tid, type, stars, charge_id, note, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)').bind(oid, Number(f.id) || 0, type, stars, ch, note || null, now).run();
+  const o = await db.prepare('SELECT * FROM star_orders WHERE order_id = ?1').bind(oid).first();
+  if (!o || o.tid !== f.id || sp.currency !== 'XTR' || sp.total_amount !== o.stars) { console.log('tg_paid_mismatch'); await led('PAYMENT', Number(sp.total_amount) || 0, 'UNMATCHED'); return J({ ok: 1 }); } /* money arrived but nothing is delivered: handle by hand with the charge id in star_ledger */
+  const c = await db.prepare("UPDATE star_orders SET status = 'PAID', charge_id = ?2, paid_at = ?3, updated_at = ?3, username = ?4, first_name = ?5, last_name = ?6 WHERE order_id = ?1 AND status = 'PENDING'").bind(oid, ch, now, f.username ? String(f.username).slice(0, 64) : null, f.first_name ? String(f.first_name).slice(0, 64) : null, f.last_name ? String(f.last_name).slice(0, 64) : null).run();
+  let cur = o;
+  if (!c.meta || !c.meta.changes) {
+    cur = await db.prepare('SELECT * FROM star_orders WHERE order_id = ?1').bind(oid).first();
+    if (!cur || cur.charge_id !== ch) { /* a SECOND, different charge for an already paid order (double tap): give the extra money back */
+      await led('PAYMENT', o.stars, 'DUPLICATE_CHARGE');
+      const r = await tgApi(env, 'refundStarPayment', { user_id: f.id, telegram_payment_charge_id: ch });
+      if (r.j && r.j.ok === true) await db.prepare("INSERT OR IGNORE INTO star_ledger (order_id, tid, type, stars, charge_id, note, created_at) VALUES (?1, ?2, 'REFUND', ?3, ?4, 'DUPLICATE_CHARGE', ?5)").bind(oid, f.id, -o.stars, ch, Date.now()).run(); else console.log('tg_dup_refund_fail', r.s);
+      return J({ ok: 1 });
+    }
+    if (cur.status === 'DELIVERED' || cur.status === 'REFUNDED' || cur.refund_status) return J({ ok: 1 }); /* Telegram sent the same payment again: nothing to do */
+  }
+  await led('PAYMENT', o.stars);
+  return (await tgDeliver(env, cur)) ? J({ ok: 1 }) : new Response(null, { status: 500 }); /* 500 = Telegram retries; delivery is idempotent */
+}
+async function tgCmd(env, m) {
+  const t = String(m.text).trim().split(/[\s@]/)[0].toLowerCase(), f = m.from || {}; let text;
+  if (t === '/terms') text = TERMS_TEXT;
+  else if (t === '/paysupport') {
+    const rows = Number.isSafeInteger(f.id) ? (await env.DB.prepare('SELECT order_id, charge_id, status FROM star_orders WHERE tid = ?1 AND charge_id IS NOT NULL ORDER BY created_at DESC LIMIT 3').bind(f.id).all()).results || [] : [];
+    text = 'Payment support\n\nYour Telegram ID: ' + f.id + '\nSend your Telegram ID, Order ID and Charge ID to: ' + (env.SUPPORT_CONTACT || 'the game owner') + '\nTelegram support cannot help with purchases made in this game.' + (rows.length ? '\n\nYour last payments:\n' + rows.map((r) => 'Order ' + r.order_id + '\nCharge ' + r.charge_id + '\nStatus ' + r.status).join('\n\n') : '');
+  } else return;
+  await tgApi(env, 'sendMessage', { chat_id: m.chat.id, text, disable_web_page_preview: true });
+}
+async function tgHook(req, env) { // authenticated ONLY by Telegram's secret-token header (set through setWebhook)
+  if (!env.TG_WEBHOOK_SECRET || !env.DB || !env.TELEGRAM_BOT_TOKEN) return new Response(null, { status: 503 });
+  if (!teq(req.headers.get('X-Telegram-Bot-Api-Secret-Token') || '', env.TG_WEBHOOK_SECRET)) { console.log('tg_hook_badsecret'); return new Response(null, { status: 401 }); }
+  const raw = await req.text(); if (raw.length > 30000) return new Response(null, { status: 413 });
+  let u; try { u = JSON.parse(raw); } catch { return new Response(null, { status: 400 }); }
+  if (u && u.pre_checkout_query) { await tgPre(env, u.pre_checkout_query); return J({ ok: 1 }); }
+  const m = u && u.message;
+  if (m && m.successful_payment) return tgPaid(env, m);
+  if (m && typeof m.text === 'string' && m.chat && m.chat.type === 'private') await tgCmd(env, m);
+  return J({ ok: 1 });
+}
+async function refundOrder(env, oid, reason) { // official refund only; the result is RECORDED (no reserve, no balance)
+  const db = env.DB; if (typeof oid !== 'string' || !SO_ID.test(oid)) return { e: 'bad' };
+  const o = await db.prepare('SELECT * FROM star_orders WHERE order_id = ?1').bind(oid).first(); if (!o || !o.charge_id) return { e: 'none' };
+  if (o.refund_status === 'REFUNDED') return { e: 'dup' }; /* never refund the same charge twice */
+  const rs = String(reason || '').slice(0, 120);
+  const c = await db.prepare("UPDATE star_orders SET refund_status = 'PENDING', refund_reason = ?3, updated_at = ?2 WHERE order_id = ?1 AND charge_id IS NOT NULL AND (refund_status IS NULL OR refund_status = 'FAILED')").bind(oid, Date.now(), rs).run();
+  if (!c.meta || !c.meta.changes) return { e: 'busy' };
+  const r = await tgApi(env, 'refundStarPayment', { user_id: o.tid, telegram_payment_charge_id: o.charge_id });
+  const d = String((r.j && r.j.description) || ''), already = /ALREADY_REFUNDED/i.test(d);
+  if (!(r.j && r.j.ok === true) && !already) { await db.prepare("UPDATE star_orders SET refund_status = 'FAILED', updated_at = ?2 WHERE order_id = ?1").bind(oid, Date.now()).run(); return { e: 'tg', d: d.slice(0, 100) || String(r.s) }; }
+  let removed = 0, note = rs;
+  if (o.status === 'DELIVERED') { /* take back the GEM that are still in the account; spent GEM are only recorded (game policy) */
+    const g = await sb(env, 'rpc/revoke_gem_order', { method: 'POST', body: JSON.stringify({ p: { ref: oid, pid: o.pid, gems: o.gems } }) });
+    if (g.ok) { const j = await g.json(); removed = Number(j && j.removed) || 0; if (j && j.short > 0) note += ' [' + j.short + ' GEM already spent]'; } else note += ' [gems not removed: db error]';
+  }
+  const now = Date.now();
+  await db.batch([
+    db.prepare("UPDATE star_orders SET status = 'REFUNDED', refund_status = 'REFUNDED', refund_date = ?2, refund_reason = ?3, refund_stars = stars, gems_removed = ?4, updated_at = ?2 WHERE order_id = ?1").bind(oid, now, note.slice(0, 160), removed),
+    db.prepare("INSERT OR IGNORE INTO star_ledger (order_id, tid, type, stars, charge_id, note, created_at) VALUES (?1, ?2, 'REFUND', ?3, ?4, ?5, ?6)").bind(oid, o.tid, -o.stars, o.charge_id, note.slice(0, 160) || null, now)
+  ]);
+  return { ok: 1, removed };
+}
+async function tgMaintain(env) { // cron: cancel stale orders, make sure Telegram points at this Worker (setWebhook is idempotent; remembered in KV for a day)
+  if (!env.DB) return;
+  await env.DB.prepare("UPDATE star_orders SET status = 'CANCELLED', updated_at = ?1 WHERE status = 'PENDING' AND created_at < ?2").bind(Date.now(), Date.now() - 86400000).run();
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TG_WEBHOOK_SECRET) return;
+  const url = String(env.PUBLIC_URL || '').replace(/\/+$/, '') + '/tg/webhook'; if (!/^https:\/\//.test(url)) return;
+  const key = 'rbr:tgwh:' + (await sign(env.JOIN_SECRET, 'wh|' + url + '|' + env.TG_WEBHOOK_SECRET)).slice(0, 12);
+  if (await env.RL.get(key)) return;
+  const r = await tgApi(env, 'setWebhook', { url, secret_token: env.TG_WEBHOOK_SECRET, allowed_updates: ['message', 'pre_checkout_query'] });
+  if (r.j && r.j.ok === true) await env.RL.put(key, '1', { expirationTtl: 86400 }); else console.log('tg_setwebhook_fail', r.s, String((r.j && r.j.description) || '').slice(0, 80));
+}
+const esc = (q) => q.replace(/[\\%_]/g, '\\$&');
+async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-admin header = ADMIN_KEY)
+  if (!(await rl(env, 'adm:' + ip, 20))) return J({ e: 'slow' }, 429);
+  if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
+  if (!env.DB) return J({ e: 'nodb' }, 503);
+  if (P === '/admin/refund') {
+    let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
+    if (req.method !== 'POST' || !b || typeof b.order_id !== 'string') return J({ e: 'bad' }, 400);
+    console.log('admin_refund', b.order_id); return J(await refundOrder(env, b.order_id, b.reason));
+  }
+  const q = (url.searchParams.get('q') || '').trim().slice(0, 64), db = env.DB;
+  const t = await db.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(status IN ('PAID','DELIVERED')),0) AS ok, COALESCE(SUM(status = 'PENDING'),0) AS pending, COALESCE(SUM(status = 'CANCELLED'),0) AS cancelled, COALESCE(SUM(status = 'REFUNDED'),0) AS refunded, COALESCE(SUM(CASE WHEN charge_id IS NOT NULL THEN stars ELSE 0 END),0) AS stars_in, COALESCE(SUM(CASE WHEN status = 'REFUNDED' THEN refund_stars ELSE 0 END),0) AS stars_refunded, COALESCE(SUM(CASE WHEN charge_id IS NOT NULL THEN gems ELSE 0 END),0) AS gems_sold, COALESCE(SUM(CASE WHEN status = 'REFUNDED' THEN gems_removed ELSE 0 END),0) AS gems_refunded FROM star_orders").first();
+  const x = await db.prepare("SELECT COUNT(*) AS paid, COALESCE(SUM(usd_cents),0) AS cents, COALESCE(SUM(gems),0) AS gems FROM orders WHERE status = 'paid'").first();
+  const rows = q ? (await db.prepare("SELECT order_id, tid, username, first_name, gems, stars, charge_id, status, refund_status, refund_reason, created_at, paid_at FROM star_orders WHERE order_id = ?1 OR charge_id = ?1 OR tid = ?2 OR username LIKE ?3 ESCAPE '\\' ORDER BY created_at DESC LIMIT 20").bind(q, /^[0-9]{1,15}$/.test(q) ? Number(q) : -1, esc(q) + '%').all()).results
+    : (await db.prepare('SELECT order_id, tid, username, first_name, gems, stars, charge_id, status, refund_status, refund_reason, created_at, paid_at FROM star_orders ORDER BY created_at DESC LIMIT 20').all()).results;
+  return J({ stars: t, xrocket: x, rows });
+}
+const ADMIN_HTML = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay admin</title><style>body{font:14px system-ui;background:#0b1220;color:#fff;margin:0;padding:10px}input,button{font-size:15px;padding:8px;margin:3px 0;border-radius:8px;border:1px solid #2bd;background:#012;color:#fff;box-sizing:border-box}button{background:#18a}#k,#q{width:100%}.g{display:grid;grid-template-columns:1fr 1fr;gap:6px}.c{background:#122;border-radius:8px;padding:8px}.c b{display:block;font-size:18px;color:#ffd166}.o{background:#122;border-radius:8px;padding:8px;margin:6px 0;word-break:break-all;font-size:12px}</style></head><body><input id="k" type="password" placeholder="ADMIN_KEY" autocomplete="off"><input id="q" placeholder="Telegram ID / username / Order ID / Charge ID"><button id="go">LOAD / SEARCH</button><div id="st" class="g"></div><div id="rows"></div><script>const $=id=>document.getElementById(id);async function call(p,o){o=o||{};o.headers=Object.assign({"x-admin":$("k").value},o.headers||{});const r=await fetch(p,o);if(r.status===404)throw new Error("wrong key");return r.json()}function card(a,b){const d=document.createElement("div");d.className="c";d.textContent=a;const x=document.createElement("b");x.textContent=b;d.appendChild(x);return d}async function load(){try{const j=await call("/admin/pay?q="+encodeURIComponent($("q").value));const s=j.stars,x=j.xrocket,S=$("st");S.textContent="";[["Total orders",s.total],["Successful",s.ok],["Pending",s.pending],["Cancelled",s.cancelled],["Refunded",s.refunded],["Stars received",s.stars_in],["Stars refunded",s.stars_refunded],["GEM sold",s.gems_sold],["GEM refunded",s.gems_refunded],["xRocket paid orders",x.paid],["xRocket USD",(x.cents/100).toFixed(2)],["xRocket GEM",x.gems]].forEach(a=>S.appendChild(card(a[0],a[1])));const R=$("rows");R.textContent="";j.rows.forEach(o=>{const d=document.createElement("div");d.className="o";d.textContent=o.order_id+" | tg "+o.tid+" | @"+(o.username||"-")+" | "+o.gems+" GEM | "+o.stars+" Stars | "+o.status+(o.refund_status?" | refund "+o.refund_status:"")+" | "+new Date(o.created_at).toISOString().slice(0,16)+" | charge "+(o.charge_id||"-")+(o.refund_reason?" | "+o.refund_reason:"");if(o.charge_id&&o.refund_status!=="REFUNDED"){const b=document.createElement("button");b.textContent="REFUND";b.onclick=async()=>{const why=prompt("Refund reason");if(why===null||!confirm("Refund "+o.stars+" Stars to tg "+o.tid+"?"))return;const r=await call("/admin/refund",{method:"POST",body:JSON.stringify({order_id:o.order_id,reason:why})});alert(JSON.stringify(r));load()};d.appendChild(document.createElement("br"));d.appendChild(b)}R.appendChild(d)})}catch(e){alert(e.message)}}$("go").onclick=load</script></body></html>';
+async function myPayments(env, ses, cors) {
+  if (!env.DB) return J({ items: [] }, 200, cors);
+  const a = (await env.DB.prepare("SELECT order_id, gems, stars, charge_id, status, refund_status, created_at FROM star_orders WHERE pid = ?1 AND status <> 'CANCELLED' ORDER BY created_at DESC LIMIT 20").bind(ses.pid).all()).results || [];
+  const b = (await env.DB.prepare("SELECT ref, gems, usd_cents, created_at FROM orders WHERE pid = ?1 AND status = 'paid' ORDER BY created_at DESC LIMIT 20").bind(ses.pid).all()).results || [];
+  const items = a.map((o) => ({ id: o.order_id, m: 'stars', gems: o.gems, price: o.stars, ch: o.charge_id || '', st: o.status === 'DELIVERED' || o.status === 'PAID' ? 'Paid' : o.status === 'REFUNDED' ? 'Refunded' : 'Pending', rf: o.refund_status || '', at: o.created_at }))
+    .concat(b.map((o) => ({ id: o.ref, m: 'xrocket', gems: o.gems, price: o.usd_cents, ch: '', st: 'Paid', rf: '', at: o.created_at }))).sort((x, y) => y.at - x.at).slice(0, 20);
+  return J({ items }, 200, cors);
+}
 const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
 const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
 
 export default {
-  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), payPending(env), autoRotate(env), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
+  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), payPending(env), autoRotate(env), tgMaintain(env).catch((e) => console.log('tgm_err', String(e && e.message))), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
   async fetch(req, env) {
     const url = new URL(req.url), origin = req.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean), okOrigin = allowed.includes(origin);
@@ -216,6 +357,9 @@ export default {
         const j = await r.json(); console.log('adr', kind, j && j.ok ? 'credit_created' : 'no_credit:' + (j && j.e)); /* the answer now says what REALLY happened: ok only if a credit exists */
         return J(j && j.ok ? { ok: 1, b: kind } : { ok: 0, e: (j && j.e) || 'err' });
       }
+      if (P === '/tg/webhook' && req.method === 'POST') return tgHook(req, env); /* Telegram bot webhook, authenticated by the secret-token header */
+      if (P === '/admin/ui' && req.method === 'GET') return new Response(ADMIN_HTML, { headers: { 'content-type': 'text/html; charset=utf-8', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'cache-control': 'no-store', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'" } });
+      if (P === '/admin/pay' || P === '/admin/refund') return admPay(req, env, url, ip, P);
       if (P === '/xrocket/webhook' && req.method === 'POST') return xrHook(req, env, ip); /* server-to-server, no Origin header, authenticated by HMAC signature */
       if (!okOrigin) return new Response(null, { status: 403 });
 
@@ -356,10 +500,15 @@ export default {
         if (!r.ok) { console.log('profile_db', r.status); return J({ e: 'err' }, 502, cors); }
         const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
       }
+      if (P === '/payments' && req.method === 'GET') {
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        return myPayments(env, ses, cors);
+      }
       if (P === '/shop' || P === '/shop/buy' || P === '/shop/equip' || P === '/vault' || P === '/royale') { /* GEM shop, vault (owned colours), lucky royale. Cosmetics only: no stat advantages are for sale. */
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
         if (!ses.pid) return J({ e: 'guest' }, 403, cors);
-        if (P === '/shop' && req.method === 'GET') return J({ packs: GEM_PACKS, test: String(env.XROCKET_BASE || '').includes('testnet') ? 1 : 0 }, 200, cors);
+        if (P === '/shop' && req.method === 'GET') return J({ packs: GEM_PACKS, test: String(env.XROCKET_BASE || '').includes('testnet') ? 1 : 0, xr: env.XROCKET_BUY === '0' ? 0 : 1, stars: env.TG_WEBHOOK_SECRET ? STAR_PRICES : 0 }, 200, cors);
         if (P === '/vault' && req.method === 'GET') {
           const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=soft_currency,premium_currency,player_cosmetics(cosmetic_id,equipped)'); const row = r.ok ? (await r.json())[0] : null;
           if (!row) return J({ e: 'err' }, 502, cors);
@@ -375,7 +524,9 @@ export default {
         if (!b || typeof b !== 'object') return J({ e: 'bad' }, 400, cors);
         let call;
         if (P === '/shop/buy') {
-          if (Object.keys(b).some((k) => k !== 'pack') || !Number.isInteger(b.pack) || b.pack < 0 || b.pack >= GEM_PACKS.length) return J({ e: 'bad' }, 400, cors);
+          if (Object.keys(b).some((k) => k !== 'pack' && k !== 'method') || (b.method !== undefined && b.method !== 'stars' && b.method !== 'xrocket') || !Number.isInteger(b.pack) || b.pack < 0 || b.pack >= GEM_PACKS.length) return J({ e: 'bad' }, 400, cors);
+          if (b.method === 'stars') return await buyStars(env, ses, b.pack, cors);
+          if (env.XROCKET_BUY === '0') return J({ e: 'pay' }, 403, cors);
           return await buyGems(env, ses, b.pack, cors); /* creates an xRocket invoice; gems arrive only through the signed webhook */
         } else if (P === '/royale') {
           if (Object.keys(b).some((k) => k !== 'kind' && k !== 'mode') || (b.kind !== 'free' && b.kind !== 'pro' && b.kind !== 'flag') || (b.mode !== 'one' && b.mode !== 'ten')) return J({ e: 'bad' }, 400, cors);
