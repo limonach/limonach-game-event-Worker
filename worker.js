@@ -32,6 +32,7 @@ const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/
 const hkey = (secret, use) => crypto.subtle.importKey('raw', typeof secret === 'string' ? enc.encode(secret) : secret, { name: 'HMAC', hash: 'SHA-256' }, false, [use]);
 const sign = async (secret, data) => b64u(await crypto.subtle.sign('HMAC', await hkey(secret, 'sign'), enc.encode(data)));
 const verify = async (secret, data, sig) => { try { return await crypto.subtle.verify('HMAC', await hkey(secret, 'verify'), unb64u(sig), enc.encode(data)); } catch { return false; } };
+const hmacHex = async (secret, data) => [...new Uint8Array(await crypto.subtle.sign('HMAC', await hkey(secret, 'sign'), enc.encode(data)))].map((b) => b.toString(16).padStart(2, '0')).join('');
 const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, '0')).join('');
 const J = (o, s, h) => new Response(JSON.stringify(o), { status: s || 200, headers: { 'content-type': 'application/json', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store', ...(h || {}) } });
 const PCOINS = [150, 125, 110, 100, 90, 80, 70, 65, 60, 55, 50, 45, 40, 35]; /* coins by team placement 1..14, then 15-20: 30, 21-30: 20, 31-40: 15, 41-52: 10 */
@@ -76,7 +77,7 @@ async function flushPending(env) { // retry end-of-match writes that failed (ide
   const l = await env.RL.list({ prefix: 'rbr:pend:', limit: 20 });
   for (const k of l.keys) { const v = await env.RL.get(k.name); if (!v) continue; try { const r = await sb(env, 'rpc/finish_match', { method: 'POST', body: v }); if (r.ok) await env.RL.delete(k.name); } catch {} }
 }
-const RK = { MIN_ACC: 8, MIN_NET: 6, LITE: 1, FIELD_MIN: 5, FULL_TH: 6, /* LITE: TEMPORARY - 1 = a match with even ONE real account still counts for RANK (placement only, among all teams); set 0 to require the full 8-player quorum for rank again. Season points ALWAYS need the full quorum. */ /* TUNE: ranked needs 8+ real accounts from 6+ different networks; placement is measured among HUMAN teams only */
+const RK = { MIN_ACC: 8, MIN_NET: 6, LITE: 1, FIELD_MIN: 5, FULL_TH: 6, /* LITE: TEMPORARY - 1 = a match with even ONE real account still counts for RANK (placement only, among all teams); set 0 to require the full 8-player quorum for rank again. Season points now count in EVERY ranked match (quorum rule removed by the owner). */ /* TUNE: ranked needs 8+ real accounts from 6+ different networks; placement is measured among HUMAN teams only */
   KNOTS: [[0, 35], [0.0196, 30], [0.039, 27], [0.059, 24], [0.078, 21], [0.098, 15], [0.176, 5], [0.196, 0], [0.372, -10], [0.392, -15], [0.569, -15], [0.588, -20], [0.765, -20], [0.784, -25], [1, -25]] }; /* placement points by percentile (your solo table, stretched to any number of teams) */
 function rankDelta(o) { /* RP change of ONE human for ONE match. o = { ranked, th (human teams), ph (human-team place), kills (HUMAN kills only), score, engaged, mode } */
   if (!o.ranked) return 0;
@@ -95,11 +96,100 @@ function liteDelta(lp, teams) { /* TEMPORARY ranked-with-few-players: RP from ov
 async function keepAlive(env) { /* one tiny read per day so the free Supabase project never counts as inactive (it pauses after ~7 idle days) */
   try { const r = await sb(env, 'seasons?select=id&limit=1'); console.log('keepalive', r.status); } catch (e) { console.log('keepalive_err', String(e && e.message)); }
 }
+
+// ---------- xRocket Pay: gem purchases (invoice -> signed webhook) and automatic USDT payouts ----------
+// Money rules: balances live ONLY in Supabase (atomic RPCs). D1 keeps the financial ledger: orders (gem invoices), payouts (state of every USDT payout) and the daily payout cap.
+// Gems are credited ONLY by the signed webhook (credit_gem_order is idempotent by order ref). Payouts use clientPayoutId = "wd-<withdrawal id>", so a retry can never pay twice.
+const XR = { INVOICE_MS: 3600000, MAX_PENDING: 5, MAX_PAYOUT_USD: 50, DAILY_CAP_USD: 300, HOLD_SCORE: 10, MAX_TRIES: 6 }; // TUNE: payouts above MAX_PAYOUT_USD, players with suspect score >= HOLD_SCORE, and anything over the daily cap wait for manual review
+const xr = async (env, method, path, body) => { // returns { s, j }; s = 0 means network failure / not configured
+  if (!env.XROCKET_TOKEN) return { s: 0, j: {} };
+  try {
+    const r = await fetch((env.XROCKET_BASE || 'https://pay.api.xrocket.exchange') + path, { method, signal: AbortSignal.timeout(10000), headers: { Authorization: 'Bearer ' + env.XROCKET_TOKEN, 'Content-Type': 'application/json', Accept: 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+    let j = {}; try { j = await r.json(); } catch {} return { s: r.status, j };
+  } catch (e) { console.log('xr_net', path); return { s: 0, j: {} }; }
+};
+const xrType = (j) => String((j && j.type) || '').replace('/api/problems/', '').slice(0, 60);
+async function buyGems(env, ses, pack, cors) {
+  if (!env.DB || !env.XROCKET_TOKEN || !Number.isSafeInteger(ses.tid)) return J({ e: 'pay' }, 503, cors);
+  const now = Date.now(), pk = GEM_PACKS[pack];
+  const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM orders WHERE pid = ?1 AND status = 'pending' AND created_at > ?2").bind(ses.pid, now - 3600000).first();
+  if (n && n.n >= XR.MAX_PENDING) return J({ e: 'slow' }, 429, cors); /* abuse: invoice spam */
+  const ref = 'g' + hex(12);
+  await env.DB.prepare('INSERT INTO orders (ref, pid, tid, pack, gems, usd_cents, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)').bind(ref, ses.pid, ses.tid, pack, pk[0], pk[1], 'pending', now).run();
+  const r = await xr(env, 'POST', '/api/v1/invoices', { clientInvoiceId: ref, priceAmount: (pk[1] / 100).toFixed(2), priceCurrency: 'USDT', description: pk[0] + ' GEM', expiresIn: XR.INVOICE_MS });
+  const inv = r.j && r.j.data && r.j.data.id ? r.j.data : r.j;
+  if (!(r.s >= 200 && r.s < 300) || !inv || typeof inv.id !== 'string') { console.log('xr_inv_fail', r.s, xrType(r.j)); await env.DB.prepare("UPDATE orders SET status = 'failed' WHERE ref = ?1").bind(ref).run(); return J({ e: 'err' }, 502, cors); }
+  await env.DB.prepare('UPDATE orders SET xr_id = ?2 WHERE ref = ?1').bind(ref, inv.id).run();
+  const lk = inv.links && typeof inv.links.telegramBotLink === 'string' && inv.links.telegramBotLink.startsWith('https://t.me/') ? inv.links.telegramBotLink : 'https://t.me/xRocket?start=' + encodeURIComponent(inv.id);
+  return J({ ok: 1, url: lk, gems: pk[0] }, 200, cors);
+}
+async function xrHook(req, env, ip) { // server-to-server webhook from xRocket: signature + freshness are verified BEFORE anything is parsed
+  if (!env.XROCKET_WEBHOOK_SECRET || !env.DB) return new Response(null, { status: 503 });
+  if (!(await rl(env, 'xrh:' + ip, 120))) return new Response(null, { status: 429 });
+  const sig = (req.headers.get('Signature') || '').toLowerCase(), ver = req.headers.get('Signature-Version'), ts = req.headers.get('Signature-Timestamp') || '';
+  if (!/^[a-f0-9]{64}$/.test(sig) || ver !== 'v1' || !/^[0-9]{10,16}$/.test(ts) || Math.abs(Date.now() - Number(ts)) > 300000) return new Response(null, { status: 401 });
+  const raw = await req.text(); if (raw.length > 20000) return new Response(null, { status: 413 });
+  if (!teq(await hmacHex(env.XROCKET_WEBHOOK_SECRET, ts + '.' + raw), sig)) { console.log('xr_hook_badsig'); return new Response(null, { status: 401 }); }
+  let e; try { e = JSON.parse(raw); } catch { return new Response(null, { status: 400 }); }
+  const d = e && e.data, inv = d && d.invoice;
+  if (!e || e.type !== 'invoice' || !d || !inv || typeof inv.id !== 'string') return J({ ok: 1 }); /* other event types: acknowledge and ignore */
+  const paid = (d.event === 'payment_status_changed' && d.payment && d.payment.status === 'paid' && d.payment.finalizedAt) || (d.event === 'invoice_status_changed' && inv.status === 'paid');
+  if (!paid) return J({ ok: 1 });
+  const ref = typeof inv.clientInvoiceId === 'string' ? inv.clientInvoiceId : '';
+  const o = await env.DB.prepare('SELECT ref, pid, gems, usd_cents FROM orders WHERE ref = ?1 OR xr_id = ?2 LIMIT 1').bind(ref, inv.id).first();
+  if (!o) { console.log('xr_hook_noorder', ref ? 'known_ref' : 'no_ref'); return ref ? J({ ok: 1 }) : new Response(null, { status: 500 }); } /* no ref and no match yet: xr_id may not be saved yet, so ask xRocket to retry */
+  if ((inv.priceAmount !== undefined && Math.round(Number(inv.priceAmount) * 100) !== o.usd_cents) || (inv.priceCurrency !== undefined && inv.priceCurrency !== 'USDT')) { console.log('xr_hook_mismatch'); return J({ ok: 1 }); } /* never credit on a mismatch */
+  const r = await sb(env, 'rpc/credit_gem_order', { method: 'POST', body: JSON.stringify({ p: { ref: o.ref, pid: o.pid, gems: o.gems, usd: o.usd_cents } }) });
+  if (!r.ok) { console.log('xr_hook_db', r.status); return new Response(null, { status: 500 }); } /* xRocket retries; the RPC is idempotent */
+  const j = await r.json(); if (!j || (!j.ok && !j.dup)) { console.log('xr_hook_rej', j && j.e); return J({ ok: 1 }); }
+  await env.DB.prepare("UPDATE orders SET status = 'paid', paid_at = ?2 WHERE ref = ?1 AND status <> 'paid'").bind(o.ref, Date.now()).run();
+  return J({ ok: 1 });
+}
+async function payWithdrawal(env, w) { // w = { id, pid, tid, usd }. Safe to call any number of times for the same withdrawal. Returns 'paid' or 'pending'.
+  if (!env.DB || !env.XROCKET_TOKEN || !Number.isSafeInteger(w.tid) || !(w.usd >= 10)) return 'pending';
+  const ref = 'wd-' + w.id, cents = Math.round(w.usd * 100), now = Date.now(), db = env.DB;
+  await db.prepare("INSERT OR IGNORE INTO payouts (ref, wid, pid, tid, usd_cents, status, tries, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'new', 0, ?6, ?6)").bind(ref, w.id, w.pid, w.tid, cents, now).run();
+  const row = await db.prepare('SELECT status, tries, xr_id FROM payouts WHERE ref = ?1').bind(ref).first(); if (!row) return 'pending';
+  const upd = (st, note, xid) => db.prepare('UPDATE payouts SET status = ?2, note = ?3, xr_id = COALESCE(?4, xr_id), tries = tries + ?5, updated_at = ?6 WHERE ref = ?1').bind(ref, st, String(note || '').slice(0, 80), xid || null, st === 'new' ? 1 : 0, Date.now()).run();
+  let xid = row.xr_id || '';
+  if (row.status === 'hold') return 'pending'; /* manual review: set status back to 'new' in D1 to release it */
+  if (row.status !== 'paid') {
+    if (row.status === 'new') { /* first attempt: guards, then reserve the daily cap */
+      if (cents > XR.MAX_PAYOUT_USD * 100) { await upd('hold', 'over_limit'); return 'pending'; }
+      const sr = await sb(env, 'suspect_summary?player_id=eq.' + w.pid + '&select=score'); if (!sr.ok) return 'pending'; /* fail closed */
+      const sc = Number(((await sr.json())[0] || {}).score) || 0; if (sc >= XR.HOLD_SCORE) { await upd('hold', 'suspect_' + sc); return 'pending'; }
+      const rs = await db.prepare('INSERT INTO payout_day (day, cents) VALUES (?1, ?2) ON CONFLICT(day) DO UPDATE SET cents = cents + ?2 WHERE cents + ?2 <= ?3').bind(new Date().toISOString().slice(0, 10), cents, XR.DAILY_CAP_USD * 100).run();
+      if (!rs.meta || !rs.meta.changes) return 'pending'; /* daily cap reached: the cron retries tomorrow */
+      await upd('sent', 'reserved'); /* 'sent' = cap reserved, xRocket call may or may not have happened */
+    }
+    const r = await xr(env, 'POST', '/api/v1/payouts', { clientPayoutId: ref, target: String(w.tid), targetType: 'telegram_user_id', asset: 'USDT', amount: (cents / 100).toFixed(2), description: 'Robot BR season reward' });
+    const ok = (r.s >= 200 && r.s < 300) || xrType(r.j) === 'payout_client_id_duplicate'; /* duplicate = the first attempt already went through */
+    if (!ok) {
+      console.log('xr_payout_fail', r.s, xrType(r.j));
+      if (r.s >= 400 && r.s < 500 && r.s !== 429) { /* definite refusal (e.g. no xRocket account, balance too low): release the cap, retry later, hold after MAX_TRIES */
+        await db.prepare('UPDATE payout_day SET cents = MAX(0, cents - ?2) WHERE day = ?1').bind(new Date().toISOString().slice(0, 10), cents).run();
+        await upd(row.tries + 1 >= XR.MAX_TRIES ? 'hold' : 'new', xrType(r.j) || ('http_' + r.s));
+      }
+      return 'pending'; /* network error / 429 / 5xx: ambiguous, stays 'sent' and the same clientPayoutId is retried */
+    }
+    xid = String((r.j && (r.j.payoutId || (r.j.data && r.j.data.payoutId))) || '');
+    await upd('paid', 'ok', xid);
+  }
+  const f = await sb(env, 'rpc/finish_withdrawal', { method: 'POST', body: JSON.stringify({ p: { wid: w.id, note: 'xrocket:' + xid } }) });
+  if (!f.ok) console.log('finish_wd_db', f.status); /* money is paid and D1 says paid: the next cron run only marks Supabase */
+  return 'paid';
+}
+async function payPending(env) { // cron: retry pending withdrawals (10 at a time)
+  if (!env.DB || !env.XROCKET_TOKEN) return;
+  const r = await sb(env, 'withdrawals?status=eq.pending&select=id,player_id,usd,players(telegram_id)&order=id.asc&limit=10'); if (!r.ok) { console.log('paypend_db', r.status); return; }
+  for (const w of await r.json()) { try { await payWithdrawal(env, { id: w.id, pid: w.player_id, tid: w.players && w.players.telegram_id, usd: Number(w.usd) }); } catch (e) { console.log('pay_err', String(e && e.message)); } }
+}
+async function autoRotate(env) { try { const r = await sb(env, 'rpc/auto_rotate_season', { method: 'POST', body: '{}' }); if (!r.ok) console.log('rotate_db', r.status); } catch (e) { console.log('rotate_err'); } }
 const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
 const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
 
 export default {
-  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
+  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), payPending(env), autoRotate(env), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
   async fetch(req, env) {
     const url = new URL(req.url), origin = req.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean), okOrigin = allowed.includes(origin);
@@ -126,6 +216,7 @@ export default {
         const j = await r.json(); console.log('adr', kind, j && j.ok ? 'credit_created' : 'no_credit:' + (j && j.e)); /* the answer now says what REALLY happened: ok only if a credit exists */
         return J(j && j.ok ? { ok: 1, b: kind } : { ok: 0, e: (j && j.e) || 'err' });
       }
+      if (P === '/xrocket/webhook' && req.method === 'POST') return xrHook(req, env, ip); /* server-to-server, no Origin header, authenticated by HMAC signature */
       if (!okOrigin) return new Response(null, { status: 403 });
 
       if (P === '/ws') {
@@ -214,7 +305,11 @@ export default {
         if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'sp') || !Number.isInteger(b.sp) || b.sp < 1 || b.sp > 10000000) return J({ e: 'bad' }, 400, cors);
         const r = await sb(env, 'rpc/' + (P === '/sp/gems' ? 'sp_buy_gems' : 'sp_withdraw'), { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid, sp: b.sp } }) });
         if (!r.ok) { console.log('sp_db', r.status); return J({ e: 'err' }, 502, cors); }
-        const j = await r.json(); if (j.ok) return J(j, 200, cors);
+        const j = await r.json();
+        if (j.ok) {
+          if (P === '/sp/withdraw' && Number.isInteger(j.wid)) { try { j.paid = (await payWithdrawal(env, { id: j.wid, pid: ses.pid, tid: ses.tid, usd: Number(j.usd) })) === 'paid' ? 1 : 0; } catch (e) { console.log('pay_err', String(e && e.message)); j.paid = 0; } }
+          return J(j, 200, cors);
+        }
         return J({ e: j.e || 'err' }, j.e === 'bad' ? 400 : j.e === 'player' ? 404 : 409, cors);
       }
       if (P === '/gemad' || P === '/gemad/claim' || P === '/match/double') { /* free-gem ad in the shop (1 GEM, 5/day, 5 min cooldown) and DOUBLE COINS after a match: both need a server-verified AdsGram credit of their own kind */
@@ -264,7 +359,7 @@ export default {
       if (P === '/shop' || P === '/shop/buy' || P === '/shop/equip' || P === '/vault' || P === '/royale') { /* GEM shop, vault (owned colours), lucky royale. Cosmetics only: no stat advantages are for sale. */
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
         if (!ses.pid) return J({ e: 'guest' }, 403, cors);
-        if (P === '/shop' && req.method === 'GET') return J({ packs: GEM_PACKS, test: env.GEM_FREE_TEST === '1' ? 1 : 0 }, 200, cors);
+        if (P === '/shop' && req.method === 'GET') return J({ packs: GEM_PACKS, test: String(env.XROCKET_BASE || '').includes('testnet') ? 1 : 0 }, 200, cors);
         if (P === '/vault' && req.method === 'GET') {
           const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=soft_currency,premium_currency,player_cosmetics(cosmetic_id,equipped)'); const row = r.ok ? (await r.json())[0] : null;
           if (!row) return J({ e: 'err' }, 502, cors);
@@ -281,8 +376,7 @@ export default {
         let call;
         if (P === '/shop/buy') {
           if (Object.keys(b).some((k) => k !== 'pack') || !Number.isInteger(b.pack) || b.pack < 0 || b.pack >= GEM_PACKS.length) return J({ e: 'bad' }, 400, cors);
-          if (env.GEM_FREE_TEST !== '1') return J({ e: 'pay' }, 403, cors); /* real payment (Telegram Stars) is not built yet: without the test flag nobody can get gems */
-          call = ['grant_gems', { pid: ses.pid, pack: b.pack, gems: GEM_PACKS[b.pack][0], usd: GEM_PACKS[b.pack][1] }];
+          return await buyGems(env, ses, b.pack, cors); /* creates an xRocket invoice; gems arrive only through the signed webhook */
         } else if (P === '/royale') {
           if (Object.keys(b).some((k) => k !== 'kind' && k !== 'mode') || (b.kind !== 'free' && b.kind !== 'pro' && b.kind !== 'flag') || (b.mode !== 'one' && b.mode !== 'ten')) return J({ e: 'bad' }, 400, cors);
           call = ['spin_royale', { pid: ses.pid, kind: b.kind, mode: b.mode }];
@@ -795,7 +889,7 @@ export class MatchRoom {
     if (alive.has(team)) return; const at = new Set(); for (const o of this.players.values()) if (o.alive) at.add(o.team); const lp = at.size + (at.has(team) ? 0 : 1); /* overall placement right now (lite rank) */
     for (const o of this.players.values()) if (!o.bot && o.team === team && !o.f) { o.hplace = alive.size + 1; o.lp = lp; this.finalize(o); }
   }
-  finalize(o) { const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid), sp = rk && this.full; let rp = 0; if (rk) rp = this.full ? rankDelta({ ranked: true, th: this.th, ph: o.hplace || 1, kills: o.hk, score: sc, engaged: o.dmgHum >= 100 || o.hk > 0 || o.assists > 0, mode: this.mode }) : liteDelta(o.lp || o.place || 1, this.teams); o.f = { sc, rk, sp, hp: o.hplace || 1, rp }; }
+  finalize(o) { const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid), sp = rk; let rp = 0; if (rk) rp = this.full ? rankDelta({ ranked: true, th: this.th, ph: o.hplace || 1, kills: o.hk, score: sc, engaged: o.dmgHum >= 100 || o.hk > 0 || o.assists > 0, mode: this.mode }) : liteDelta(o.lp || o.place || 1, this.teams); o.f = { sc, rk, sp, hp: o.hplace || 1, rp }; }
   zoneProg(el) { /* 0..5: how far the zone sequence has progressed (each phase counts 1, fractions inside a phase) */ let t = el; for (let i = 0; i < C.PHASES.length; i++) { const d = C.PHASES[i][0] + C.PHASES[i][1]; if (t < d) return i + t / d; t -= d; } return C.PHASES.length; }
   score(p) { /* MATCH SCORE: starts at 30; every source is capped (zone 25, kills 10, damage 8, assists 6, placement 17 => max 96) */ return Math.min(100, 30 + Math.min(25, p.zs) + Math.min(10, p.ksc) + Math.min(8, p.dmgS / 125) + Math.min(6, p.asc) + Math.min(17, p.ps)); }
   res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills, o.f ? o.f.sc : Math.round(this.score(o))), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0, o.f && o.f.sp ? 1 : 0]; }
