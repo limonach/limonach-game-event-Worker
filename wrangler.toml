@@ -10,6 +10,7 @@ SUPABASE_URL = "https://pktulmzlxgrqqmlgwzfh.supabase.co"
 XROCKET_BASE = "https://pay.api.testnet.xrocket.exchange"   # TESTNET while testing. For REAL money use https://pay.api.xrocket.exchange (and then replace the two xRocket secrets with the production ones)
 PUBLIC_URL = "https://limonach-game-event-worker.ayoubvib130.workers.dev"   # the Worker's own address (used to register the Telegram webhook)
 SUPPORT_CONTACT = "@CHANGE_ME"   # REQUIRED by Telegram: your support username/link, shown by /paysupport
+STAR_TEST_PACK = "1"   # shows a 1 Star = 1 GEM test pack. DELETE this line after testing.
 XROCKET_BUY = "1"   # "0" hides the xRocket (USDT) option in the shop and refuses USDT gem purchases; Stars stay
 ALLOW_GUEST = "0"   # production: only Telegram accounts. Set "1" only for temporary browser tests.
 

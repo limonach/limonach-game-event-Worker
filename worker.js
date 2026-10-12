@@ -111,7 +111,7 @@ const xr = async (env, method, path, body) => { // returns { s, j }; s = 0 means
 const xrType = (j) => String((j && j.type) || '').replace('/api/problems/', '').slice(0, 60);
 async function buyGems(env, ses, pack, cors) {
   if (!env.DB || !env.XROCKET_TOKEN || !Number.isSafeInteger(ses.tid)) return J({ e: 'pay' }, 503, cors);
-  const now = Date.now(), pk = GEM_PACKS[pack];
+  const now = Date.now(), pk = packsOf(env)[pack]; if (!pk || pk[1] < 50) return J({ e: 'bad' }, 400, cors); /* the 1-Star test pack is Stars-only */
   const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM orders WHERE pid = ?1 AND status = 'pending' AND created_at > ?2").bind(ses.pid, now - 3600000).first();
   if (n && n.n >= XR.MAX_PENDING) return J({ e: 'slow' }, 429, cors); /* abuse: invoice spam */
   const ref = 'g' + hex(12);
@@ -189,7 +189,8 @@ async function autoRotate(env) { try { const r = await sb(env, 'rpc/auto_rotate_
 // ---------- Telegram Stars (XTR): digital goods paid inside Telegram ----------
 // Flow: client sends only { pack } -> Worker reads the price HERE -> createInvoiceLink -> Mini App openInvoice -> Telegram webhook (pre_checkout_query, successful_payment, secret-token protected)
 // -> D1 star_orders (PENDING -> PAID -> DELIVERED) -> Supabase credit_gem_order (idempotent by order id). Refunds only through the official refundStarPayment method; they are RECORDED, nothing is reserved.
-const STAR_PRICES = [99, 299, 499, 999, 1999, 4999]; // TUNE: Stars per pack, same index as GEM_PACKS (100 Stars = 1 USD of in-game value). The ONLY place prices exist; the client never sends a price.
+const STAR_PRICES = [99, 299, 499, 999, 1999, 4999, 1]; /* the last entry belongs to the TEST pack (1 Star = 1 GEM), only offered while the STAR_TEST_PACK variable is "1" */
+const packsOf = (env) => (env.STAR_TEST_PACK === '1' ? GEM_PACKS.concat([[1, 1]]) : GEM_PACKS); // TUNE: Stars per pack, same index as GEM_PACKS (100 Stars = 1 USD of in-game value). The ONLY place prices exist; the client never sends a price.
 const SO_ID = /^s[0-9a-f]{24}$/;
 const TERMS_TEXT = 'Robot BR - Terms of Service and Refund Policy\n\n1. GEM is a virtual in-game currency sold as a digital product. It has no cash value and cannot be withdrawn, sold or transferred.\n2. Payment is made in Telegram Stars (or in USDT through xRocket where offered). The purchase is delivered automatically after the payment is confirmed.\n3. Refunds: send /paysupport with your Order ID. Mistaken or undelivered purchases are refunded. If the purchased GEM were already spent, the refund may be declined.\n4. Telegram support cannot help with purchases made in this game.\n5. Telegram Stars terms: https://telegram.org/tos/stars';
 const tgApi = async (env, method, body) => { // never logs the URL (it contains the bot token)
@@ -201,7 +202,7 @@ const tgApi = async (env, method, body) => { // never logs the URL (it contains 
 };
 async function buyStars(env, ses, pack, cors) {
   if (!env.DB || !env.TELEGRAM_BOT_TOKEN || !env.TG_WEBHOOK_SECRET || !Number.isSafeInteger(ses.tid)) return J({ e: 'pay' }, 503, cors);
-  const now = Date.now(), pk = GEM_PACKS[pack], stars = STAR_PRICES[pack];
+  const now = Date.now(), pk = packsOf(env)[pack], stars = STAR_PRICES[pack];
   const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM star_orders WHERE pid = ?1 AND status = 'PENDING' AND created_at > ?2").bind(ses.pid, now - 3600000).first();
   if (n && n.n >= XR.MAX_PENDING) return J({ e: 'slow' }, 429, cors); /* abuse: invoice spam */
   const oid = 's' + hex(12);
@@ -508,7 +509,7 @@ export default {
       if (P === '/shop' || P === '/shop/buy' || P === '/shop/equip' || P === '/vault' || P === '/royale') { /* GEM shop, vault (owned colours), lucky royale. Cosmetics only: no stat advantages are for sale. */
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
         if (!ses.pid) return J({ e: 'guest' }, 403, cors);
-        if (P === '/shop' && req.method === 'GET') return J({ packs: GEM_PACKS, test: String(env.XROCKET_BASE || '').includes('testnet') ? 1 : 0, xr: env.XROCKET_BUY === '0' ? 0 : 1, stars: env.TG_WEBHOOK_SECRET ? STAR_PRICES : 0 }, 200, cors);
+        if (P === '/shop' && req.method === 'GET') return J({ packs: packsOf(env), test: String(env.XROCKET_BASE || '').includes('testnet') ? 1 : 0, xr: env.XROCKET_BUY === '0' ? 0 : 1, stars: env.TG_WEBHOOK_SECRET ? STAR_PRICES.slice(0, packsOf(env).length) : 0 }, 200, cors);
         if (P === '/vault' && req.method === 'GET') {
           const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=soft_currency,premium_currency,player_cosmetics(cosmetic_id,equipped)'); const row = r.ok ? (await r.json())[0] : null;
           if (!row) return J({ e: 'err' }, 502, cors);
@@ -524,7 +525,7 @@ export default {
         if (!b || typeof b !== 'object') return J({ e: 'bad' }, 400, cors);
         let call;
         if (P === '/shop/buy') {
-          if (Object.keys(b).some((k) => k !== 'pack' && k !== 'method') || (b.method !== undefined && b.method !== 'stars' && b.method !== 'xrocket') || !Number.isInteger(b.pack) || b.pack < 0 || b.pack >= GEM_PACKS.length) return J({ e: 'bad' }, 400, cors);
+          if (Object.keys(b).some((k) => k !== 'pack' && k !== 'method') || (b.method !== undefined && b.method !== 'stars' && b.method !== 'xrocket') || !Number.isInteger(b.pack) || b.pack < 0 || b.pack >= packsOf(env).length) return J({ e: 'bad' }, 400, cors);
           if (b.method === 'stars') return await buyStars(env, ses, b.pack, cors);
           if (env.XROCKET_BUY === '0') return J({ e: 'pay' }, 403, cors);
           return await buyGems(env, ses, b.pack, cors); /* creates an xRocket invoice; gems arrive only through the signed webhook */
