@@ -48,6 +48,6 @@ crons = ["*/10 * * * *", "0 6 * * *"]   # retries any end-of-match write that fa
 [[d1_databases]]
 binding = "DB"
 database_name = "robot-br-fin"
-database_id = "PASTE_YOUR_D1_DATABASE_ID_HERE"
+database_id = "1df3d35b-fc94-4804-993b-c71c44c8178c"
 
 # New secrets (Worker -> Settings -> Variables and Secrets): XROCKET_TOKEN (API Token) and XROCKET_WEBHOOK_SECRET (Webhook Token). Webhook URL in @xRocket: https://limonach-game-event-worker.ayoubvib130.workers.dev/xrocket/webhook
