@@ -1,15 +1,18 @@
-# ROBOT BATTLE ROYALE - Stage 3 - wrangler.toml (repo root, next to worker.js; used by Workers Builds / Git deploy)
-# Secrets (NOT here): JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN
+# ROBOT BATTLE ROYALE - wrangler.toml (repo root, next to worker.js; used by Workers Builds / Git deploy)
+# Secrets (NOT here): JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN, ADSGRAM_SECRET, XROCKET_TOKEN, XROCKET_WEBHOOK_SECRET, TG_WEBHOOK_SECRET
 name = "limonach-game-event-worker"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
+[observability]
+enabled = true   # keeps the Logs tab working (without this a Git deploy turns logs off)
+
 [vars]
 ALLOWED_ORIGIN = "https://limonach-game-event.pages.dev"
 SUPABASE_URL = "https://pktulmzlxgrqqmlgwzfh.supabase.co"
-XROCKET_BASE = "https://pay.api.testnet.xrocket.exchange"   # TESTNET while testing. For REAL money use https://pay.api.xrocket.exchange (and then replace the two xRocket secrets with the production ones)
+XROCKET_BASE = "https://pay.api.xrocket.exchange"   # PRODUCTION (real money). No trailing dot, no trailing slash.
 PUBLIC_URL = "https://limonach-game-event-worker.ayoubvib130.workers.dev"   # the Worker's own address (used to register the Telegram webhook)
-SUPPORT_CONTACT = "@LIMONACH"   # REQUIRED by Telegram: your support username/link, shown by /paysupport
+SUPPORT_CONTACT = "@LIMONACH"   # shown by /paysupport (required by Telegram)
 STAR_TEST_PACK = "1"   # shows a 1 Star = 1 GEM test pack. DELETE this line after testing.
 XROCKET_BUY = "1"   # "0" hides the xRocket (USDT) option in the shop and refuses USDT gem purchases; Stars stay
 ALLOW_GUEST = "0"   # production: only Telegram accounts. Set "1" only for temporary browser tests.
@@ -42,16 +45,13 @@ new_sqlite_classes = ["RateLimiter"]
 binding = "RL"
 id = "90b4297ff1a64a919c35b3e0b60cbe5f"
 
-[triggers]
-crons = ["*/10 * * * *", "0 6 * * *"]   # retries any end-of-match write that failed
-
-# LOAD TESTS ONLY: add this line under [vars] (and delete it again afterwards):
-# LOADTEST = "1"
-
-# Financial ledger (Cloudflare D1). Create the database in Dashboard -> Storage & Databases -> D1, run d1.sql in its Console, then paste its ID below.
 [[d1_databases]]
 binding = "DB"
 database_name = "robot-br-fin"
-database_id = "PASTE_YOUR_D1_DATABASE_ID_HERE"
+database_id = "1df3d35b-fc94-4804-993b-c71c44c8178c"
 
-# New secrets (Worker -> Settings -> Variables and Secrets): XROCKET_TOKEN (API Token) and XROCKET_WEBHOOK_SECRET (Webhook Token). Webhook URL in @xRocket: https://limonach-game-event-worker.ayoubvib130.workers.dev/xrocket/webhook
+[triggers]
+crons = ["*/10 * * * *", "0 6 * * *"]   # retries failed match writes + pending USDT payouts + auto seasons + Telegram webhook check; daily Supabase keep-alive
+
+# LOAD TESTS ONLY: add this line under [vars] (and delete it again afterwards):
+# LOADTEST = "1"
