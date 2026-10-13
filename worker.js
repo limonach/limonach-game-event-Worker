@@ -669,7 +669,7 @@ export class MatchRoom {
 
   reset() {
     this.state = 'lobby'; this.seed = (Math.random() * 4294967296) >>> 0; this.R = rng(this.seed);
-    this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.nextId = 1; this.nextB = 1000;
+    this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.born = []; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
     this.lastPh = 0; this.lastTk = 0; this.lastZp = 0; this.pAw = 0; this.ranked = false; this.full = false; this.outAt = 0; this.th = 1; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
@@ -1002,6 +1002,7 @@ export class MatchRoom {
         for (let n = 0; n < W0.n; n++) {
           const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
           this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, man: man ? 1 : 0, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
+          const nb = this.bullets[this.bullets.length - 1]; nb.sx = nb.x; nb.sy = nb.y; this.born.push(nb); /* remembered until the next snapshot so even a bullet that dies within 100 ms is still shown to the clients */
         }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; } else if (!p.bot) p.zs += 5 * dzp; /* match score: zone points grow gradually, only while alive INSIDE the safe zone */
@@ -1022,7 +1023,7 @@ export class MatchRoom {
         });
       }
       b.dist += b.sp * dt; if (b.dist >= b.rg) dead = true;
-      if (!dead) keep.push(b);
+      if (!dead) keep.push(b); else b.dead = 1;
     }
     this.bullets = keep;
     for (const p of this.players.values()) if (p.alive && p.hp <= 0) this.kill(p, now);
@@ -1033,6 +1034,7 @@ export class MatchRoom {
     if (this.tickN % C.SNAP_EVERY === 0) {
       const gAll = this.grid(true), zArr = [z.cx | 0, z.cy | 0, z.r | 0, z.tcx | 0, z.tcy | 0, z.tr | 0, Math.ceil(z.left), z.ph, z.dps, z.shrink];
       for (const h of this.players.values()) if (!h.bot && h.ws) this.snap(h, gAll, zArr, alive, el);
+      this.born = [];
     }
   }
 
@@ -1060,10 +1062,14 @@ export class MatchRoom {
       for (const e of a) {
         if (e === h || e.x < x0 || e.x > x1 || e.y < y0 || e.y > y1) continue;
         seen.add(e.id);
-        if (e.blt) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0, e.o]); } }
+        if (e.blt) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0, e.o, Math.max(0, e.rg - Math.hypot(e.x - e.sx, e.y - e.sy)) | 0]); } }
         else if (e.l) { if (!known.has(e.id)) { known.set(e.id, 1); L.push([e.id, e.t, e.x | 0, e.y | 0, e.v | 0]); } }
         else { const s = (e.x | 0) + ',' + (e.y | 0) + ',' + e.aim + ',' + Math.ceil(e.hp); if (known.get(e.id) !== s) { known.set(e.id, s); P.push([e.id, e.x | 0, e.y | 0, e.aim, Math.ceil(e.hp)]); } }
       }
+    }
+    for (const e of this.born) { /* bullets born AND dead between two snapshots: send them once (spawn point, travelled distance) so every shot is visible */
+      if (!e.dead || known.has(e.id) || e.sx < x0 || e.sx > x1 || e.sy < y0 || e.sy > y1) continue;
+      known.set(e.id, 1); B.push([e.id, e.sx | 0, e.sy | 0, e.vx | 0, e.vy | 0, e.o, Math.hypot(e.x - e.sx, e.y - e.sy) | 0]);
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
     this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w * 3 + h.wr, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h)]);
