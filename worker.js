@@ -222,7 +222,7 @@ async function tgPre(env, q) { // must answer within 10 s: one D1 read + one Sup
   } catch (e) { console.log('tg_pre_err', String(e && e.message)); return deny('Temporary error, please try again.'); }
 }
 async function tgDeliver(env, o) { /* idempotent: credit_gem_order dedupes on the order id */
-  const r = await sb(env, 'rpc/credit_gem_order', { method: 'POST', body: JSON.stringify({ p: { ref: o.order_id, pid: o.pid, gems: o.gems, usd: o.usd_cents, src: 'stars' } }) });
+  const r = o.pack === PASS_PACK ? await sb(env, 'rpc/grant_pass_stars', { method: 'POST', body: JSON.stringify({ p: { ref: o.order_id, pid: o.pid } }) }) : await sb(env, 'rpc/credit_gem_order', { method: 'POST', body: JSON.stringify({ p: { ref: o.order_id, pid: o.pid, gems: o.gems, usd: o.usd_cents, src: 'stars' } }) });
   if (!r.ok) { console.log('tg_deliver_db', r.status); return false; }
   const j = await r.json(); if (!j || (!j.ok && !j.dup)) { console.log('tg_deliver_rej', j && j.e); return false; }
   await env.DB.prepare("UPDATE star_orders SET status = 'DELIVERED', delivered_at = ?2, updated_at = ?2 WHERE order_id = ?1 AND status = 'PAID'").bind(o.order_id, Date.now()).run();
@@ -281,7 +281,7 @@ async function refundOrder(env, oid, reason) { // official refund only; the resu
   if (!(r.j && r.j.ok === true) && !already) { await db.prepare("UPDATE star_orders SET refund_status = 'FAILED', updated_at = ?2 WHERE order_id = ?1").bind(oid, Date.now()).run(); return { e: 'tg', d: d.slice(0, 100) || String(r.s) }; }
   let removed = 0, note = rs;
   if (o.status === 'DELIVERED') { /* take back the GEM that are still in the account; spent GEM are only recorded (game policy) */
-    const g = await sb(env, 'rpc/revoke_gem_order', { method: 'POST', body: JSON.stringify({ p: { ref: oid, pid: o.pid, gems: o.gems } }) });
+    const g = o.pack === PASS_PACK ? await sb(env, 'rpc/revoke_pass', { method: 'POST', body: JSON.stringify({ p: { ref: oid } }) }) : await sb(env, 'rpc/revoke_gem_order', { method: 'POST', body: JSON.stringify({ p: { ref: oid, pid: o.pid, gems: o.gems } }) });
     if (g.ok) { const j = await g.json(); removed = Number(j && j.removed) || 0; if (j && j.short > 0) note += ' [' + j.short + ' GEM already spent]'; } else note += ' [gems not removed: db error]';
   }
   const now = Date.now();
@@ -321,11 +321,55 @@ async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-ad
 const ADMIN_HTML = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay admin</title><style>body{font:14px system-ui;background:#0b1220;color:#fff;margin:0;padding:10px}input,button{font-size:15px;padding:8px;margin:3px 0;border-radius:8px;border:1px solid #2bd;background:#012;color:#fff;box-sizing:border-box}button{background:#18a}#k,#q{width:100%}.g{display:grid;grid-template-columns:1fr 1fr;gap:6px}.c{background:#122;border-radius:8px;padding:8px}.c b{display:block;font-size:18px;color:#ffd166}.o{background:#122;border-radius:8px;padding:8px;margin:6px 0;word-break:break-all;font-size:12px}</style></head><body><input id="k" type="password" placeholder="ADMIN_KEY" autocomplete="off"><input id="q" placeholder="Telegram ID / username / Order ID / Charge ID"><button id="go">LOAD / SEARCH</button><div id="st" class="g"></div><div id="rows"></div><script>const $=id=>document.getElementById(id);async function call(p,o){o=o||{};o.headers=Object.assign({"x-admin":$("k").value},o.headers||{});const r=await fetch(p,o);if(r.status===404)throw new Error("wrong key");return r.json()}function card(a,b){const d=document.createElement("div");d.className="c";d.textContent=a;const x=document.createElement("b");x.textContent=b;d.appendChild(x);return d}async function load(){try{const j=await call("/admin/pay?q="+encodeURIComponent($("q").value));const s=j.stars,x=j.xrocket,S=$("st");S.textContent="";[["Total orders",s.total],["Successful",s.ok],["Pending",s.pending],["Cancelled",s.cancelled],["Refunded",s.refunded],["Stars received",s.stars_in],["Stars refunded",s.stars_refunded],["GEM sold",s.gems_sold],["GEM refunded",s.gems_refunded],["xRocket paid orders",x.paid],["xRocket USD",(x.cents/100).toFixed(2)],["xRocket GEM",x.gems]].forEach(a=>S.appendChild(card(a[0],a[1])));const R=$("rows");R.textContent="";j.rows.forEach(o=>{const d=document.createElement("div");d.className="o";d.textContent=o.order_id+" | tg "+o.tid+" | @"+(o.username||"-")+" | "+o.gems+" GEM | "+o.stars+" Stars | "+o.status+(o.refund_status?" | refund "+o.refund_status:"")+" | "+new Date(o.created_at).toISOString().slice(0,16)+" | charge "+(o.charge_id||"-")+(o.refund_reason?" | "+o.refund_reason:"");if(o.charge_id&&o.refund_status!=="REFUNDED"){const b=document.createElement("button");b.textContent="REFUND";b.onclick=async()=>{const why=prompt("Refund reason");if(why===null||!confirm("Refund "+o.stars+" Stars to tg "+o.tid+"?"))return;const r=await call("/admin/refund",{method:"POST",body:JSON.stringify({order_id:o.order_id,reason:why})});alert(JSON.stringify(r));load()};d.appendChild(document.createElement("br"));d.appendChild(b)}R.appendChild(d)})}catch(e){alert(e.message)}}$("go").onclick=load</script></body></html>';
 async function myPayments(env, ses, cors) {
   if (!env.DB) return J({ items: [] }, 200, cors);
-  const a = (await env.DB.prepare("SELECT order_id, gems, stars, charge_id, status, refund_status, created_at FROM star_orders WHERE pid = ?1 AND status <> 'CANCELLED' ORDER BY created_at DESC LIMIT 20").bind(ses.pid).all()).results || [];
+  const a = (await env.DB.prepare("SELECT order_id, pack, gems, stars, charge_id, status, refund_status, created_at FROM star_orders WHERE pid = ?1 AND status <> 'CANCELLED' ORDER BY created_at DESC LIMIT 20").bind(ses.pid).all()).results || [];
   const b = (await env.DB.prepare("SELECT ref, gems, usd_cents, created_at FROM orders WHERE pid = ?1 AND status = 'paid' ORDER BY created_at DESC LIMIT 20").bind(ses.pid).all()).results || [];
-  const items = a.map((o) => ({ id: o.order_id, m: 'stars', gems: o.gems, price: o.stars, ch: o.charge_id || '', st: o.status === 'DELIVERED' || o.status === 'PAID' ? 'Paid' : o.status === 'REFUNDED' ? 'Refunded' : 'Pending', rf: o.refund_status || '', at: o.created_at }))
+  const items = a.map((o) => ({ id: o.order_id, m: 'stars', pass: o.pack === PASS_PACK ? 1 : 0, gems: o.gems, price: o.stars, ch: o.charge_id || '', st: o.status === 'DELIVERED' || o.status === 'PAID' ? 'Paid' : o.status === 'REFUNDED' ? 'Refunded' : 'Pending', rf: o.refund_status || '', at: o.created_at }))
     .concat(b.map((o) => ({ id: o.ref, m: 'xrocket', gems: o.gems, price: o.usd_cents, ch: '', st: 'Paid', rf: '', at: o.created_at }))).sort((x, y) => y.at - x.at).slice(0, 20);
   return J({ items }, 200, cors);
+}
+
+// ---------- SEASON PASS (monthly) ----------
+// Pass XP per match = placement points below (from the owner's tables). 250 XP per tier, 30 tiers. Computed HERE and sent to the DB; the client never sends XP.
+const PASS_PACK = 100, PASS_STARS = 299; // TUNE: star_orders.pack = 100 marks a Season Pass order; premium costs 300 GEM (fixed inside the buy_pass_gems SQL function) or PASS_STARS stars
+const SXP = {
+  solo: [[1, 100], [2, 90], [3, 85], [4, 80], [5, 75], [10, 65], [15, 55], [20, 45], [25, 40], [30, 35], [35, 30], [40, 25], [45, 20], [50, 15], [52, 10]],
+  duo: [[1, 100], [2, 90], [3, 85], [4, 80], [5, 75], [6, 65], [7, 60], [8, 55], [9, 50], [10, 45], [12, 40], [14, 35], [16, 30], [18, 25], [20, 22], [22, 18], [24, 15], [26, 12], [28, 10]],
+  squad: [[1, 100], [2, 90], [3, 85], [4, 80], [5, 75], [6, 65], [7, 60], [8, 55], [9, 50], [10, 45], [11, 35], [12, 25], [13, 15], [14, 10]] };
+const seasonXp = (mode, place) => { const t = SXP[mode] || SXP.solo; for (const r of t) if (place <= r[0]) return r[1]; return t[t.length - 1][1]; };
+async function buyPassStars(env, ses, cors) {
+  if (!env.DB || !env.TELEGRAM_BOT_TOKEN || !env.TG_WEBHOOK_SECRET || !Number.isSafeInteger(ses.tid)) return J({ e: 'pay' }, 503, cors);
+  const g = await sb(env, 'rpc/get_pass', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) }); if (!g.ok) return J({ e: 'err' }, 502, cors);
+  const gj = await g.json(); if (!gj || !gj.ok) return J({ e: 'err' }, 404, cors); if (gj.premium) return J({ e: 'owned' }, 409, cors);
+  const now = Date.now(), n = await env.DB.prepare("SELECT COUNT(*) AS n FROM star_orders WHERE pid = ?1 AND status = 'PENDING' AND created_at > ?2").bind(ses.pid, now - 3600000).first();
+  if (n && n.n >= XR.MAX_PENDING) return J({ e: 'slow' }, 429, cors);
+  const oid = 's' + hex(12);
+  await env.DB.prepare("INSERT INTO star_orders (order_id, tid, pid, pack, gems, stars, usd_cents, currency, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, 'XTR', 'PENDING', ?7, ?7)").bind(oid, ses.tid, ses.pid, PASS_PACK, PASS_STARS, PASS_STARS, now).run();
+  const r = await tgApi(env, 'createInvoiceLink', { title: 'Season Pass Premium', description: 'Premium track of the current monthly Season Pass (digital good)', payload: oid, currency: 'XTR', prices: [{ label: 'Premium Season Pass', amount: PASS_STARS }] });
+  if (!(r.j && r.j.ok === true && typeof r.j.result === 'string' && r.j.result.startsWith('https://t.me/'))) { console.log('tg_pass_invoice_fail', r.s); await env.DB.prepare("UPDATE star_orders SET status = 'CANCELLED', updated_at = ?2 WHERE order_id = ?1").bind(oid, Date.now()).run(); return J({ e: 'err' }, 502, cors); }
+  return J({ ok: 1, url: r.j.result, stars: PASS_STARS }, 200, cors);
+}
+async function passApi(env, ses, req, P, cors) { // /pass (GET), /pass/claim, /pass/buy, /box/open
+  if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+  if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+  const call = async (fn, p) => { const r = await sb(env, 'rpc/' + fn, { method: 'POST', body: JSON.stringify({ p }) }); if (!r.ok) { console.log('pass_db', fn, r.status); return J({ e: 'err' }, 502, cors); } const j = await r.json(); if (j && j.ok) return J(j, 200, cors); const e = (j && j.e) || 'err'; return J({ e }, e === 'bad' ? 400 : e === 'player' ? 404 : 409, cors); };
+  if (P === '/pass' && req.method === 'GET') { const r = await sb(env, 'rpc/get_pass', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) }); if (!r.ok) { console.log('pass_db', r.status); return J({ e: 'err' }, 502, cors); } const j = await r.json(); if (!j || !j.ok) return J({ e: 'err' }, 404, cors); j.price_stars = PASS_STARS; return J(j, 200, cors); }
+  if (req.method !== 'POST' || P === '/pass') return new Response(null, { status: 405 });
+  let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+  if (!b || typeof b !== 'object') return J({ e: 'bad' }, 400, cors);
+  if (P === '/pass/claim') {
+    if (Object.keys(b).some((k) => k !== 'tier' && k !== 'track' && k !== 'dbl') || !Number.isInteger(b.tier) || b.tier < 1 || b.tier > 30 || (b.track !== 'free' && b.track !== 'premium') || (b.dbl !== undefined && typeof b.dbl !== 'boolean')) return J({ e: 'bad' }, 400, cors);
+    if (b.dbl && !Number.isSafeInteger(ses.tid)) return J({ e: 'auth' }, 401, cors);
+    return call('claim_pass_tier', { pid: ses.pid, tid: ses.tid || 0, tier: b.tier, track: b.track, dbl: !!b.dbl });
+  }
+  if (P === '/box/open') {
+    if (Object.keys(b).some((k) => k !== 'n') || !Number.isInteger(b.n) || b.n < 1 || b.n > 20) return J({ e: 'bad' }, 400, cors);
+    return call('open_box', { pid: ses.pid, n: b.n });
+  }
+  if (P === '/pass/buy') {
+    if (Object.keys(b).some((k) => k !== 'method') || (b.method !== 'gems' && b.method !== 'stars')) return J({ e: 'bad' }, 400, cors);
+    return b.method === 'gems' ? call('buy_pass_gems', { pid: ses.pid }) : buyPassStars(env, ses, cors);
+  }
+  return new Response(null, { status: 404 });
 }
 const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
 const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
@@ -351,7 +395,7 @@ export default {
         if (!teq(kk, env.ADSGRAM_SECRET)) { console.log('adr_reject: wrong or missing k'); return new Response(null, { status: 404 }); }
         if (!/^[0-9]{1,15}$/.test(uid)) { console.log('adr_reject: userid is not a number'); return J({ e: 'bad' }, 400); }
         const kind = url.searchParams.get('b') || 'daily'; /* which AdsGram block was watched: daily | x2 | gem (no b = the old daily URL) */
-        if (kind !== 'daily' && kind !== 'x2' && kind !== 'gem') { console.log('adr_reject: unknown b=' + kind.slice(0, 12)); return J({ e: 'bad' }, 400); }
+        if (kind !== 'daily' && kind !== 'x2' && kind !== 'gem' && kind !== 'pf' && kind !== 'pp') { console.log('adr_reject: unknown b=' + kind.slice(0, 12)); return J({ e: 'bad' }, 400); }
         if (!(await rl(env, 'adr:' + uid, 10))) return J({ e: 'slow' }, 429);
         const r = await sb(env, 'rpc/add_ad_credit', { method: 'POST', body: JSON.stringify({ p: { tid: Number(uid), kind } }) });
         if (!r.ok) { console.log('adr_db', r.status); return J({ e: 'err' }, 502); }
@@ -501,6 +545,7 @@ export default {
         if (!r.ok) { console.log('profile_db', r.status); return J({ e: 'err' }, 502, cors); }
         const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
       }
+      if (P === '/pass' || P === '/pass/claim' || P === '/pass/buy' || P === '/box/open') return passApi(env, ses, req, P, cors);
       if (P === '/payments' && req.method === 'GET') {
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
         if (!ses.pid) return J({ e: 'guest' }, 403, cors);
@@ -1046,7 +1091,7 @@ export class MatchRoom {
   finalize(o) { const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid), sp = rk; let rp = 0; if (rk) rp = this.full ? rankDelta({ ranked: true, th: this.th, ph: o.hplace || 1, kills: o.hk, score: sc, engaged: o.dmgHum >= 100 || o.hk > 0 || o.assists > 0, mode: this.mode }) : liteDelta(o.lp || o.place || 1, this.teams); o.f = { sc, rk, sp, hp: o.hplace || 1, rp }; }
   zoneProg(el) { /* 0..5: how far the zone sequence has progressed (each phase counts 1, fractions inside a phase) */ let t = el; for (let i = 0; i < C.PHASES.length; i++) { const d = C.PHASES[i][0] + C.PHASES[i][1]; if (t < d) return i + t / d; t -= d; } return C.PHASES.length; }
   score(p) { /* MATCH SCORE: starts at 30; every source is capped (zone 25, kills 10, damage 8, assists 6, placement 17 => max 96) */ return Math.min(100, 30 + Math.min(25, p.zs) + Math.min(10, p.ksc) + Math.min(8, p.dmgS / 125) + Math.min(6, p.asc) + Math.min(17, p.ps)); }
-  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills, o.f ? o.f.sc : Math.round(this.score(o))), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0, o.f && o.f.sp ? 1 : 0]; }
+  res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), Math.min(o.xp, 3200), reward(o.place || 1, o.kills, o.f ? o.f.sc : Math.round(this.score(o))), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0, o.f && o.f.sp ? 1 : 0, seasonXp(this.mode, o.place || 1)]; }
   specOf(h) { /* dead player in duo/squad: follow a living teammate (shows exactly what that teammate already sees) */
     const l = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h && m.alive) l.push(m);
     if (!l.length) return null;
@@ -1083,7 +1128,7 @@ export class MatchRoom {
     }
     for (const p of this.players.values()) if (!p.bot && !p.f) { if (!p.hplace) p.hplace = 1; if (!p.lp) p.lp = p.place || 1; this.finalize(p); } /* survivors and winners get their ranked result now */
     const s = this.stats();
-    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills, p.f ? p.f.sc : Math.round(this.score(p))), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams, p.f ? p.f.sc : Math.round(this.score(p)), p.f ? p.f.rp : 0, p.f && p.f.rk ? 1 : 0, p.f && p.f.sp ? 1 : 0]); }
+    for (const p of this.players.values()) { if (p.ws) this.sockMs += now - p.ws._t0; if (!p.bot) this.send(p.ws, [3, reason, p.place || 1, p.kills, Math.round(p.dmg), Math.min(p.xp, 3200), reward(p.place || 1, p.kills, p.f ? p.f.sc : Math.round(this.score(p))), Math.round(((p.dieAt || now) - this.startAt) / 1000), this.teams, p.f ? p.f.sc : Math.round(this.score(p)), p.f ? p.f.rp : 0, p.f && p.f.rk ? 1 : 0, p.f && p.f.sp ? 1 : 0, seasonXp(this.mode, p.place || 1)]); }
     for (const p of this.players.values()) if (p.ws) p.ws._t0 = now;
     console.log(JSON.stringify({ ev: 'end', reason, ...s, suspicious: this.susp.length }));
     const hum = [...this.players.values()].filter((p) => !p.bot);
@@ -1117,7 +1162,7 @@ export class MatchRoom {
   tm(h) { const o = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h) o.push([m.id, m.x | 0, m.y | 0, m.alive ? 1 : 0]); return o; } // teammates only (minimap + markers)
   async persist(now, hum) { // ONE atomic, idempotent RPC at match end (zero writes during the match)
     const byId = new Map(hum.map((p) => [p.id, p]));
-    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills, p.f ? p.f.sc : Math.round(this.score(p))), match_score: p.f ? p.f.sc : null, rp_delta: p.f ? p.f.rp : 0, ranked: !!(p.f && p.f.rk), sp_ok: !!(p.f && p.f.sp), hplace: p.f ? p.f.hp : null }));
+    const mp = hum.filter((p) => p.pid).map((p) => ({ player_id: p.pid, placement: p.place || 1, kills: p.kills, assists: p.assists || 0, damage: Math.round(p.dmg), xp_in_match: Math.min(p.xp, 3200), max_level: p.lvl, survived_s: Math.round(((p.dieAt || now) - this.startAt) / 1000), reward_soft: reward(p.place || 1, p.kills, p.f ? p.f.sc : Math.round(this.score(p))), match_score: p.f ? p.f.sc : null, rp_delta: p.f ? p.f.rp : 0, ranked: !!(p.f && p.f.rk), sp_ok: !!(p.f && p.f.sp), hplace: p.f ? p.f.hp : null, season_xp: seasonXp(this.mode, p.place || 1) }));
     if (!mp.length) return; // guests are never persisted
     const sl = this.flags(now, hum); // evidence rows for suspicion_logs (flag + log only: no automatic bans from statistics)
     const iso = (t) => new Date(t).toISOString();
