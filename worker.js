@@ -25,6 +25,39 @@ const COS_ID = /^(hull|cannon|track|detail|glow|bullet|trail|blast|smoke|flag)_[
 const GEM_PACKS = [[100, 99], [310, 299], [520, 499], [1060, 999], [2180, 1999], [5600, 4999]]; /* gems, price in USD cents (display + audit; real payments are not built yet) */
 const pickCos = (rows) => { const got = {}; for (const r of Array.isArray(rows) ? rows : []) { const m = r && typeof r.cosmetic_id === 'string' ? COS_ID.exec(r.cosmetic_id) : null; if (m && !got[m[1]]) got[m[1]] = r.cosmetic_id; } return Object.values(got).join(','); }; // one equipped id per type, validated
 const parseCos = (s) => { const o = {}; for (const id of String(s).split(',')) { const m = COS_ID.exec(id); if (m && !o[m[1]]) o[m[1]] = id; } return o; };
+
+// ---------- WEAPONS: chosen in the lobby (GUNS), no weapon loot in the match ----------
+// Every weapon is free and "normal": the budget is roughly 45-60 damage per second, the trade-off is rate / damage / range / pellets. cd is a multiple of 50 ms (one server tick).
+// Reach rule: spawn 30 + range + 28 must stay < 360 (half of the 720 view height), so no range goes above 290. Magazines/reloading are NOT simulated. TUNE every number here.
+// fields: id, c (ar|smg|sn|sg), dmg per bullet, cd ms between triggers, sp bullet speed, rg range, n pellets, spr spread degrees between pellets, bu bullets per burst, gp ms between burst bullets
+const WPN = [
+  { id: 'ar01', c: 'ar', dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'ak47', c: 'ar', dmg: 17, cd: 350, sp: 1400, rg: 250, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'm4a1', c: 'ar', dmg: 10, cd: 200, sp: 1450, rg: 250, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'scar', c: 'ar', dmg: 14, cd: 300, sp: 1400, rg: 250, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'famas', c: 'ar', dmg: 8, cd: 500, sp: 1450, rg: 240, n: 1, spr: 0, bu: 3, gp: 50 },
+  { id: 'aug', c: 'ar', dmg: 12, cd: 250, sp: 1500, rg: 260, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'groza', c: 'ar', dmg: 14, cd: 250, sp: 1400, rg: 230, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'xm8', c: 'ar', dmg: 10, cd: 250, sp: 1500, rg: 275, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'mp40', c: 'smg', dmg: 5, cd: 100, sp: 1350, rg: 170, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'mp5', c: 'smg', dmg: 7, cd: 150, sp: 1350, rg: 190, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'ump', c: 'smg', dmg: 9, cd: 200, sp: 1350, rg: 210, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'vector', c: 'smg', dmg: 2.6, cd: 50, sp: 1350, rg: 165, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'p90', c: 'smg', dmg: 4.5, cd: 100, sp: 1350, rg: 190, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'mac10', c: 'smg', dmg: 6, cd: 100, sp: 1350, rg: 150, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'awm', c: 'sn', dmg: 70, cd: 1500, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'kar98', c: 'sn', dmg: 50, cd: 1100, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'm24', c: 'sn', dmg: 45, cd: 950, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'svd', c: 'sn', dmg: 30, cd: 650, sp: 2500, rg: 280, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'sks', c: 'sn', dmg: 22, cd: 450, sp: 2300, rg: 270, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'dragunov', c: 'sn', dmg: 34, cd: 750, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
+  { id: 'm1887', c: 'sg', dmg: 7, cd: 1200, sp: 1200, rg: 150, n: 5, spr: 8, bu: 2, gp: 150 },
+  { id: 'm1014', c: 'sg', dmg: 6, cd: 650, sp: 1200, rg: 160, n: 5, spr: 8, bu: 1, gp: 0 },
+  { id: 'spas12', c: 'sg', dmg: 9, cd: 1100, sp: 1200, rg: 160, n: 6, spr: 9, bu: 1, gp: 0 },
+  { id: 's1897', c: 'sg', dmg: 9, cd: 800, sp: 1200, rg: 170, n: 5, spr: 7, bu: 1, gp: 0 },
+  { id: 'dbs', c: 'sg', dmg: 5, cd: 800, sp: 1200, rg: 150, n: 4, spr: 9, bu: 2, gp: 50 }];
+const WPN_IDX = Object.fromEntries(WPN.map((x, i) => [x.id, i]));
+const wpnRow = (x) => [x.id, x.c, x.dmg, x.cd, x.sp, x.rg, x.n, x.spr, x.bu, x.gp];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const enc = new TextEncoder();
 const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -412,10 +445,10 @@ export default {
       if (P === '/ws') {
         if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
         const t = await rdTok(env, 'J1.', url.searchParams.get('t'));
-        if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n) || !/^[a-z0-9_,]{0,220}$/.test(t.cs || '') || !/^[\p{L}\p{N} _-]{0,24}$/u.test(t.nm || '') || (t.pm !== undefined && t.pm !== 0 && t.pm !== 1)) return new Response(null, { status: 401 });
+        if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n) || !/^[a-z0-9_,]{0,220}$/.test(t.cs || '') || !/^[\p{L}\p{N} _-]{0,24}$/u.test(t.nm || '') || (t.pm !== undefined && t.pm !== 0 && t.pm !== 1) || (t.wp !== undefined && WPN_IDX[t.wp] === undefined)) return new Response(null, { status: 401 });
         const ipc = (await sign(env.JOIN_SECRET, 'ip|' + ip + '|' + t.m)).slice(0, 10); // salted per match: same-network detection inside one match, no raw IP stored anywhere
         const r2 = new Request(req);
-        for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)], ['x-ipc', ipc], ['x-cs', t.cs || ''], ['x-nm', encodeURIComponent(t.nm || '')], ['x-pm', t.pm ? '1' : '']]) r2.headers.set(k, v);
+        for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)], ['x-ipc', ipc], ['x-cs', t.cs || ''], ['x-nm', encodeURIComponent(t.nm || '')], ['x-pm', t.pm ? '1' : ''], ['x-wp', t.wp || 'ar01']]) r2.headers.set(k, v);
         return env.MATCH.get(env.MATCH.idFromName(t.m)).fetch(r2);
       }
 
@@ -547,6 +580,20 @@ export default {
         const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
       }
       if (P === '/pass' || P === '/pass/claim' || P === '/pass/buy' || P === '/box/open') return passApi(env, ses, req, P, cors);
+      if (P === '/guns' || P === '/gun/equip') { /* GUNS vault: pick one of the free weapons; it is used from the NEXT match */
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        if (P === '/guns' && req.method === 'GET') {
+          let cur = 'ar01'; const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=weapon'); if (r.ok) { const row = (await r.json())[0]; if (row && typeof row.weapon === 'string' && WPN_IDX[row.weapon] !== undefined) cur = row.weapon; }
+          return J({ cur, list: WPN.map(wpnRow) }, 200, cors);
+        }
+        if (req.method !== 'POST' || P === '/guns') return new Response(null, { status: 405 });
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'id') || typeof b.id !== 'string' || WPN_IDX[b.id] === undefined) return J({ e: 'bad' }, 400, cors);
+        const r = await sb(env, 'players?id=eq.' + ses.pid, { method: 'PATCH', headers: { Prefer: 'return=minimal' }, body: JSON.stringify({ weapon: b.id }) });
+        if (!r.ok) { console.log('gun_db', r.status); return J({ e: 'err' }, 502, cors); }
+        return J({ ok: 1, id: b.id }, 200, cors);
+      }
       if (P === '/payments' && req.method === 'GET') {
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
         if (!ses.pid) return J({ e: 'guest' }, 403, cors);
@@ -594,11 +641,11 @@ export default {
         if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'mode' && k !== 'code' && !(k === 'cap' && env.LOADTEST === '1'))) return J({ e: 'bad' }, 400, cors); /* cap = players per match, accepted ONLY while the temporary LOADTEST variable is set */
         if (P === '/join') {
           if (!K.TEAM[b.mode] || typeof b.mode !== 'string') return J({ e: 'bad' }, 400, cors);
-          let cs = '', nm = '', pm = 0;
-          if (ses.pid) { const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=name,banned,player_cosmetics(cosmetic_id),pass_progress(premium)&player_cosmetics.equipped=eq.true&pass_progress.month=eq.' + passMonth()); const row = r.ok ? (await r.json())[0] : null; if (!row) return J({ e: 'err' }, 503, cors); if (row.banned) return J({ e: 'banned' }, 403, cors); cs = pickCos(row.player_cosmetics); nm = String(row.name || '').replace(/[^\p{L}\p{N} _-]/gu, '').trim().slice(0, 24); pm = Array.isArray(row.pass_progress) && row.pass_progress.some((x) => x && x.premium === true) ? 1 : 0; } // fail closed
+          let cs = '', nm = '', pm = 0, wp = 'ar01';
+          if (ses.pid) { const q = (cols) => sb(env, 'players?id=eq.' + ses.pid + '&select=' + cols + 'player_cosmetics(cosmetic_id),pass_progress(premium)&player_cosmetics.equipped=eq.true&pass_progress.month=eq.' + passMonth()); let r = await q('name,banned,weapon,'); if (!r.ok) r = await q('name,banned,'); /* the weapon column may not exist yet: join without it instead of failing */ const row = r.ok ? (await r.json())[0] : null; if (!row) return J({ e: 'err' }, 503, cors); if (row.banned) return J({ e: 'banned' }, 403, cors); cs = pickCos(row.player_cosmetics); nm = String(row.name || '').replace(/[^\p{L}\p{N} _-]/gu, '').trim().slice(0, 24); pm = Array.isArray(row.pass_progress) && row.pass_progress.some((x) => x && x.premium === true) ? 1 : 0; if (typeof row.weapon === 'string' && WPN_IDX[row.weapon] !== undefined) wp = row.weapon; } // fail closed
           const [st, j] = await mmCall(env, '/join', { u: ses.u, md: b.mode, cap: env.LOADTEST === '1' && Number.isInteger(b.cap) ? b.cap : 0 });
           if (st !== 200) return J({ e: j.e || 'err' }, st, cors);
-          const t = await mkTok(env, 'J1.', { u: ses.u, pid: ses.pid, m: j.m, md: j.md, pt: j.pt, cs, nm, pm, exp: Date.now() + K.JOIN_MS, n: hex(8) });
+          const t = await mkTok(env, 'J1.', { u: ses.u, pid: ses.pid, m: j.m, md: j.md, pt: j.pt, cs, nm, pm, wp, exp: Date.now() + K.JOIN_MS, n: hex(8) });
           return J({ t, md: j.md, m: j.m }, 200, cors);
         }
         const [st, j] = await mmCall(env, P, { u: ses.u, code: b.code });
@@ -784,13 +831,13 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', cs: {}, skill: 0.6 + Math.random() * 0.4, aggr: Math.random(), tgt: 0, tgtAt: 0, side: 1, sideAt: 0, idleUntil: 0, ssd: 1, forceRoam: 0, skip: 0, skipUntil: 0, stuckN: 0, want: 0, cur: 0, chkAt: 0, cx: 0, cy: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0, zs: 0, ksc: 0, asc: 0, ps: 0, dmgS: 0, hk: 0, dmgHum: 0, hplace: 0, f: null };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, burstLeft: 0, burstAt: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', cs: {}, skill: 0.6 + Math.random() * 0.4, aggr: Math.random(), tgt: 0, tgtAt: 0, side: 1, sideAt: 0, idleUntil: 0, ssd: 1, forceRoam: 0, skip: 0, skipUntil: 0, stuckN: 0, want: 0, cur: 0, chkAt: 0, cx: 0, cy: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0, zs: 0, ksc: 0, asc: 0, ps: 0, dmgS: 0, hk: 0, dmgHum: 0, hplace: 0, f: null };
     this.players.set(p.id, p); return p;
   }
 
   genLoot() { // server-only loot: 0 scrap,1 part,2 chip,3 small shield,4 large shield,5 repair,6 crate
     this.loot = new Map(); this.lg = new Map(); this.nextL = 10000000; const R = this.R;
-    const roll = () => { const r = R(); return r < 0.4 ? 0 : r < 0.64 ? 1 : r < 0.72 ? 2 : r < 0.8 ? 3 : r < 0.84 ? 4 : r < 0.89 ? 5 : r < 0.94 ? 6 : r < 0.97 ? 7 : 8; };
+    const roll = () => { const r = R(); return r < 0.4 ? 0 : r < 0.64 ? 1 : r < 0.72 ? 2 : r < 0.8 ? 3 : r < 0.84 ? 4 : r < 0.89 ? 5 : r < 0.94 ? 6 : 0; }; /* weapons are chosen in the lobby now: the old weapon loot became scrap */
     const lv = (t) => t === 6 ? 40 + Math.floor(R() * 61) : t >= 7 ? (R() < 0.6 ? 0 : R() < 0.75 ? 1 : 2) : 0; // crate xp / weapon rarity
     for (const b of this.bl) for (let i = 0; i < C.LOOT_IN; i++) { const t = roll(); this.addLoot(t, b.x + 50 + R() * (b.w - 100), b.y + 50 + R() * (b.h - 100), lv(t)); }
     for (let i = 0; i < C.LOOT_OUT; i++) { const a = R() * 6.2832, d = Math.sqrt(R()) * 3700, x = 4000 + Math.cos(a) * d, y = 4000 + Math.sin(a) * d; if (this.hit(x, y, 14)) continue; const t = roll(); this.addLoot(t, x, y, lv(t)); }
@@ -822,6 +869,14 @@ export class MatchRoom {
     const mh = C.HP * (1 + 0.15 * p.b[1]); p.hp += mh - p.maxHp; p.maxHp = mh; p.maxSh = C.SHIELD_BASE * (1 + 0.1 * p.b[4]);
     if (p.lq > 0) this.offer(p);
   }
+  shoot(p, man) { /* one trigger pull (or one burst bullet): n pellets spread around the aim */
+    const W0 = WPN[p.w];
+    for (let n = 0; n < W0.n; n++) {
+      const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spr : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
+      this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, man: man ? 1 : 0, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
+      const nb = this.bullets[this.bullets.length - 1]; nb.sx = nb.x; nb.sy = nb.y; this.born.push(nb); /* remembered until the next snapshot so even a bullet that dies within 100 ms is still shown to the clients */
+    }
+  }
   humans() { let n = 0; for (const p of this.players.values()) if (!p.bot) n++; return n; }
   aliveHumans() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.alive) n++; return n; }
   connected() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.ws) n++; return n; }
@@ -840,18 +895,18 @@ export class MatchRoom {
     for (const [k, v] of this.nonces) if (v < now) this.nonces.delete(k);
     const pair = new WebSocketPair(); const [cl, sv] = Object.values(pair);
     let nm = ''; try { nm = decodeURIComponent(req.headers.get('x-nm') || ''); } catch {} nm = nm.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 24);
-    sv.accept(); this.onOpen(sv, gid, pid, pt, ipc, cs, nm, req.headers.get('x-pm') === '1' ? 1 : 0);
+    sv.accept(); this.onOpen(sv, gid, pid, pt, ipc, cs, nm, req.headers.get('x-pm') === '1' ? 1 : 0, req.headers.get('x-wp') || 'ar01');
     return new Response(null, { status: 101, webSocket: cl });
   }
 
-  onOpen(ws, gid, pid, pt, ipc, cs, nm, pm) {
+  onOpen(ws, gid, pid, pt, ipc, cs, nm, pm, wp) {
     const now = Date.now(); ws._t0 = now; ws._win = 0; ws._cnt = 0;
     let p = this.byGid.get(gid);
     if (p && !p.bot) { if (p.ws && p.ws !== ws) { try { p.ws.close(1000, 'dup'); } catch {} } p.ws = ws; p.dcAt = 0; p.known = new Map(); p.seq = 0; p.ack = 0; p.lastIn = 0; } /* reconnect: the new client knows nothing yet, so full state is resent and the input counter restarts */
-    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; p.ipc = String(ipc).slice(0, 10); p.cs = parseCos(cs); p.name = nm || 'Player'; p.prem = !!pm; this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
+    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; p.ipc = String(ipc).slice(0, 10); p.cs = parseCos(cs); p.name = nm || 'Player'; p.prem = !!pm; p.w = WPN_IDX[wp] !== undefined ? WPN_IDX[wp] : 0; this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
     else { this.mm('/busy', { m: this.mid, u: gid }); this.send(ws, [3, 'busy']); try { ws.close(1000, 'busy'); } catch {} return; }
     ws._p = p;
-    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV, this.ob.map((o) => [o.x, o.y, o.r, o.t, o.v])]);
+    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV, this.ob.map((o) => [o.x, o.y, o.r, o.t, o.v]), WPN.map((x) => [x.id, x.dmg, x.cd, x.sp, x.rg, x.n, x.spr, x.bu, x.gp])]);
     if (this.rosterMsg) this.send(ws, this.rosterMsg); // reconnect after the match started
     if (p.pend) this.send(ws, [5, p.lvl, p.pend]);
     ws.addEventListener('message', (e) => this.onMsg(p, ws, e.data));
@@ -916,7 +971,8 @@ export class MatchRoom {
     this.tl = teams; this.teams = teams.length;
     this.th = teams.filter((t) => t.some((p) => !p.bot)).length; { const acc = hum.filter((p) => p.pid); this.full = acc.length >= RK.MIN_ACC && new Set(acc.map((p) => p.ipc)).size >= RK.MIN_NET; this.ranked = this.full || (RK.LITE > 0 && acc.length >= 1); } /* full quorum = real rank + season points; lite = rank only (temporary) */
     for (const p of all) if (p.bot) for (const t of Object.keys(C.BOT_COS)) if (Math.random() < (t === 'flag' || t === 'smoke' ? 0.15 : 0.4)) p.cs[t] = C.BOT_COS[t][Math.floor(Math.random() * C.BOT_COS[t].length)]; // bots wear common items so they look like players
-    this.rosterMsg = [6, all.map((p) => [p.id, p.cs.hull || '', p.cs.cannon || '', p.cs.track || '', p.cs.detail || '', p.cs.glow || '', p.cs.bullet || '', p.cs.trail || '', p.cs.blast || '', p.cs.smoke || '', p.cs.flag || '', p.name || '', p.prem ? 1 : 0])]; // cosmetic ids + display name + premium flag (no positions): visual info, validated server-side
+    for (const p of all) if (p.bot) p.w = Math.floor(Math.random() * WPN.length); /* bots carry random weapons */
+    this.rosterMsg = [6, all.map((p) => [p.id, p.cs.hull || '', p.cs.cannon || '', p.cs.track || '', p.cs.detail || '', p.cs.glow || '', p.cs.bullet || '', p.cs.trail || '', p.cs.blast || '', p.cs.smoke || '', p.cs.flag || '', p.name || '', p.prem ? 1 : 0, p.w | 0])]; // cosmetic ids + display name + premium flag (no positions): visual info, validated server-side
     for (const p of hum) this.send(p.ws, this.rosterMsg);
     this.mm('/started', { m: this.mid, md: this.mode });
     this.state = 'running'; this.startAt = now; this.msgsMatch = 0;
@@ -935,7 +991,7 @@ export class MatchRoom {
 
   // Bot states: flee zone > fight (react delay, strafe, retreat when hurt) > loot (shields/repair/weapons) > roam. Bots never fight each other in the first BOT_PEACE_S seconds.
   think(b, now) {
-    const z = this.z, el = (now - this.startAt) / 1000, rg = Math.min(C.MAX_RANGE, C.WEAPONS[b.w].rg);
+    const z = this.z, el = (now - this.startAt) / 1000, rg = Math.min(C.MAX_RANGE, WPN[b.w].rg);
     if (b.want && Math.hypot(b.x - b.lx, b.y - b.ly) < 6) b.stuckN++; else b.stuckN = 0; // asked to move but did not
     let stuck = b.stuckN >= 4;
     if (now >= b.chkAt) { if (b.chkAt && b.want && Math.hypot(b.x - b.cx, b.y - b.cy) < 60) stuck = true; b.cx = b.x; b.cy = b.y; b.chkAt = now + 3000; } // wiggling in place for 3 s also counts as stuck
@@ -1032,7 +1088,7 @@ export class MatchRoom {
         let tg = null, bd = 1e9;
         this.q(this.gP, p.x, p.y, C.AUTO_RANGE, (e) => { if (e === p || e.team === p.team) return; const d = Math.hypot(e.x - p.x, e.y - p.y); if (d < bd && d <= C.AUTO_RANGE) { bd = d; tg = e; } });
         if (now >= p.noiseAt) { p.noiseAt = now + 250; p.noise = (Math.random() * 2 - 1) * C.AUTO_ERR; }
-        if (tg) { p.aim = nrm(Math.atan2(tg.y - p.y, tg.x - p.x) * 57.2958 + p.noise); p.fire = bd <= C.WEAPONS[p.w].rg ? 1 : p.mfire; } else { p.aim = p.maim; p.fire = p.mfire; }
+        if (tg) { p.aim = nrm(Math.atan2(tg.y - p.y, tg.x - p.x) * 57.2958 + p.noise); p.fire = bd <= WPN[p.w].rg ? 1 : p.mfire; } else { p.aim = p.maim; p.fire = p.mfire; }
       }
       if (p.b[6] && now - p.hitAt > 5000 && p.hp < p.maxHp) p.hp = Math.min(p.maxHp, p.hp + p.b[6] * dt);
       if (!p.bot) { const pr = C.PICK_R * (1 + 0.2 * p.b[7]); this.q(this.lg, p.x, p.y, pr, (it) => { if (!it.gone && Math.hypot(it.x - p.x, it.y - p.y) <= pr) this.take(p, it); }); } // server-side pickup range check
@@ -1044,13 +1100,11 @@ export class MatchRoom {
         if (!this.hit(p.x, ny, C.R)) p.y = ny;
         p.x = Math.max(C.R, Math.min(C.WORLD - C.R, p.x)); p.y = Math.max(C.R, Math.min(C.WORLD - C.R, p.y));
       }
+      if (p.burstLeft > 0 && now >= p.burstAt) { this.shoot(p, false); p.burstLeft--; p.burstAt = now + WPN[p.w].gp; } /* the next bullet of a burst (FAMAS, M1887, DB shotgun) */
       if (p.fire && now >= p.cd) {
-        const W0 = C.WEAPONS[p.w], rar = C.RAR[p.wr], man = !p.bot && !p.auto && W0.n === 1; if (man) p.shots++; /* only manual single-bullet shots count for accuracy */ p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
-        for (let n = 0; n < W0.n; n++) {
-          const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spread : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
-          this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, man: man ? 1 : 0, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg * rar, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
-          const nb = this.bullets[this.bullets.length - 1]; nb.sx = nb.x; nb.sy = nb.y; this.born.push(nb); /* remembered until the next snapshot so even a bullet that dies within 100 ms is still shown to the clients */
-        }
+        const W0 = WPN[p.w], man = !p.bot && !p.auto && W0.n === 1 && W0.bu === 1; if (man) p.shots++; /* only manual single-bullet shots count for accuracy */
+        p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
+        this.shoot(p, man); if (W0.bu > 1) { p.burstLeft = W0.bu - 1; p.burstAt = now + W0.gp; }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; } else if (!p.bot) p.zs += 5 * dzp; /* match score: zone points grow gradually, only while alive INSIDE the safe zone */
     }
@@ -1126,7 +1180,7 @@ export class MatchRoom {
       known.set(e.id, 1); B.push([e.id, e.sx | 0, e.sy | 0, e.vx | 0, e.vy | 0, e.o, Math.hypot(e.x - e.sx, e.y - e.sy) | 0]);
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w * 3 + h.wr, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h)]);
+    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h)]);
   }
 
   finish(now, reason) {
