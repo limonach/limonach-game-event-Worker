@@ -179,44 +179,73 @@ async function xrHook(req, env, ip) { // server-to-server webhook from xRocket: 
   await env.DB.prepare("UPDATE orders SET status = 'paid', paid_at = ?2 WHERE ref = ?1 AND status <> 'paid'").bind(o.ref, Date.now()).run();
   return J({ ok: 1 });
 }
-async function payWithdrawal(env, w) { // w = { id, pid, tid, usd }. Safe to call any number of times for the same withdrawal. Returns 'paid' or 'pending'.
-  if (!env.DB || !env.XROCKET_TOKEN || !Number.isSafeInteger(w.tid) || !(w.usd >= 10)) return 'pending';
-  const ref = 'wd-' + w.id, cents = Math.round(w.usd * 100), now = Date.now(), db = env.DB;
-  await db.prepare("INSERT OR IGNORE INTO payouts (ref, wid, pid, tid, usd_cents, status, tries, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'new', 0, ?6, ?6)").bind(ref, w.id, w.pid, w.tid, cents, now).run();
+
+// ---------- USDT withdrawals to a TON wallet ----------
+const crc16 = (u) => { let c = 0; for (const b of u) { c ^= b << 8; for (let i = 0; i < 8; i++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xffff : (c << 1) & 0xffff; } return c; };
+function tonAddr(s, testnet) { /* friendly TON address (48 chars, EQ.../UQ...): decoded and its CRC16 checked, so a typo can never reach the payout. Returns { key } (canonical, the same wallet always gives the same key) or null. */
+  if (typeof s !== 'string' || s.length !== 48 || !/^[A-Za-z0-9_-]{48}$/.test(s)) return null;
+  let u; try { u = unb64u(s); } catch { return null; } if (u.length !== 36) return null;
+  const tag = u[0], tn = (tag & 0x80) !== 0, t2 = tag & 0x7f, wc = u[1]; if (t2 !== 0x11 && t2 !== 0x51) return null; if (tn !== !!testnet) return null; if (wc !== 0 && wc !== 0xff) return null;
+  if (crc16(u.subarray(0, 34)) !== ((u[34] << 8) | u[35])) return null;
+  return { key: (wc === 0xff ? '-1' : '0') + ':' + [...u.subarray(2, 34)].map((b) => b.toString(16).padStart(2, '0')).join('') };
+}
+const isTestnet = (env) => String(env.XROCKET_BASE || '').includes('testnet');
+async function payWithdrawal(env, w) { // w = { id, pid, tid, usd, addr }. Safe to call any number of times for the same withdrawal. Returns 'paid' | 'refunded' | 'pending'.
+  if (!env.DB || !env.XROCKET_TOKEN || typeof w.addr !== 'string' || !tonAddr(w.addr, isTestnet(env)) || !(w.usd >= 1)) return 'pending';
+  const ref = 'wd-' + w.id, cents = Math.round(w.usd * 100), now = Date.now(), db = env.DB, day = () => new Date().toISOString().slice(0, 10);
+  await db.prepare("INSERT OR IGNORE INTO payouts (ref, wid, pid, tid, usd_cents, status, tries, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'new', 0, ?6, ?6)").bind(ref, w.id, w.pid, Number(w.tid) || 0, cents, now).run();
   const row = await db.prepare('SELECT status, tries, xr_id FROM payouts WHERE ref = ?1').bind(ref).first(); if (!row) return 'pending';
   const upd = (st, note, xid) => db.prepare('UPDATE payouts SET status = ?2, note = ?3, xr_id = COALESCE(?4, xr_id), tries = tries + ?5, updated_at = ?6 WHERE ref = ?1').bind(ref, st, String(note || '').slice(0, 80), xid || null, st === 'new' ? 1 : 0, Date.now()).run();
-  let xid = row.xr_id || '';
+  const refund = async (note) => { /* a definite refusal: give the Season Points back (idempotent, only for still-pending requests) */
+    await db.prepare('UPDATE payout_day SET cents = MAX(0, cents - ?2) WHERE day = ?1').bind(day(), cents).run();
+    const f = await sb(env, 'rpc/refund_withdrawal', { method: 'POST', body: JSON.stringify({ p: { wid: w.id, note: String(note).slice(0, 100) } }) });
+    if (!f.ok) { console.log('refund_wd_db', f.status); return 'pending'; } await upd('failed', note); return 'refunded';
+  };
+  const done = async (xid) => { await upd('paid', 'ok', xid); const f = await sb(env, 'rpc/finish_withdrawal', { method: 'POST', body: JSON.stringify({ p: { wid: w.id, note: 'xrocket:' + xid } }) }); if (!f.ok) console.log('finish_wd_db', f.status); return 'paid'; };
+  const FIN = /^(finished|completed|success|succeeded|done|paid)$/i, BAD = /^(failed|canceled|cancelled|rejected|error|declined)$/i;
+  const stOf = (r) => String((r.j && (r.j.status || (r.j.data && r.j.data.status))) || '');
+  const xidOf = (r) => String((r.j && (r.j.withdrawalId || r.j.id || (r.j.data && (r.j.data.withdrawalId || r.j.data.id)))) || '');
   if (row.status === 'hold') return 'pending'; /* manual review: set status back to 'new' in D1 to release it */
-  if (row.status !== 'paid') {
-    if (row.status === 'new') { /* first attempt: guards, then reserve the daily cap */
-      if (cents > XR.MAX_PAYOUT_USD * 100) { await upd('hold', 'over_limit'); return 'pending'; }
-      const sr = await sb(env, 'suspect_summary?player_id=eq.' + w.pid + '&select=score'); if (!sr.ok) return 'pending'; /* fail closed */
-      const sc = Number(((await sr.json())[0] || {}).score) || 0; if (sc >= XR.HOLD_SCORE) { await upd('hold', 'suspect_' + sc); return 'pending'; }
-      const rs = await db.prepare('INSERT INTO payout_day (day, cents) VALUES (?1, ?2) ON CONFLICT(day) DO UPDATE SET cents = cents + ?2 WHERE cents + ?2 <= ?3').bind(new Date().toISOString().slice(0, 10), cents, XR.DAILY_CAP_USD * 100).run();
-      if (!rs.meta || !rs.meta.changes) return 'pending'; /* daily cap reached: the cron retries tomorrow */
-      await upd('sent', 'reserved'); /* 'sent' = cap reserved, xRocket call may or may not have happened */
-    }
-    const r = await xr(env, 'POST', '/api/v1/payouts', { clientPayoutId: ref, target: String(w.tid), targetType: 'telegram_user_id', asset: 'USDT', amount: (cents / 100).toFixed(2), description: 'Robot BR season reward' });
-    const ok = (r.s >= 200 && r.s < 300) || xrType(r.j) === 'payout_client_id_duplicate'; /* duplicate = the first attempt already went through */
-    if (!ok) {
-      console.log('xr_payout_fail', r.s, xrType(r.j));
-      if (r.s >= 400 && r.s < 500 && r.s !== 429) { /* definite refusal (e.g. no xRocket account, balance too low): release the cap, retry later, hold after MAX_TRIES */
-        await db.prepare('UPDATE payout_day SET cents = MAX(0, cents - ?2) WHERE day = ?1').bind(new Date().toISOString().slice(0, 10), cents).run();
-        await upd(row.tries + 1 >= XR.MAX_TRIES ? 'hold' : 'new', xrType(r.j) || ('http_' + r.s));
-      }
-      return 'pending'; /* network error / 429 / 5xx: ambiguous, stays 'sent' and the same clientPayoutId is retried */
-    }
-    xid = String((r.j && (r.j.payoutId || (r.j.data && r.j.data.payoutId))) || '');
-    await upd('paid', 'ok', xid);
+  if (row.status === 'paid') return done(row.xr_id || '');
+  if (row.status === 'failed') return 'refunded';
+  if (row.status === 'new') { /* first attempt: guards, then reserve the daily cap */
+    if (cents > XR.MAX_PAYOUT_USD * 100) { await upd('hold', 'over_limit'); return 'pending'; }
+    const sr = await sb(env, 'suspect_summary?player_id=eq.' + w.pid + '&select=score'); if (!sr.ok) return 'pending'; /* fail closed */
+    const sc = Number(((await sr.json())[0] || {}).score) || 0; if (sc >= XR.HOLD_SCORE) { await upd('hold', 'suspect_' + sc); return 'pending'; }
+    const rs = await db.prepare('INSERT INTO payout_day (day, cents) VALUES (?1, ?2) ON CONFLICT(day) DO UPDATE SET cents = cents + ?2 WHERE cents + ?2 <= ?3').bind(day(), cents, XR.DAILY_CAP_USD * 100).run();
+    if (!rs.meta || !rs.meta.changes) return 'pending'; /* daily cap reached: the cron retries tomorrow */
+    await upd('sent', 'reserved'); /* 'sent' = cap reserved, the xRocket call may or may not have happened */
   }
-  const f = await sb(env, 'rpc/finish_withdrawal', { method: 'POST', body: JSON.stringify({ p: { wid: w.id, note: 'xrocket:' + xid } }) });
-  if (!f.ok) console.log('finish_wd_db', f.status); /* money is paid and D1 says paid: the next cron run only marks Supabase */
-  return 'paid';
+  if (row.status === 'new' || row.status === 'sent') {
+    /* the exact field names of POST /api/v1/withdrawals are not in the public page, so a validation-type 400 retries once with the alternative spelling; clientWithdrawalId makes every attempt idempotent */
+    const body = { clientWithdrawalId: ref, network: 'TON', address: w.addr, amount: (cents / 100).toFixed(2), comment: 'Robot BR season reward' };
+    let r = await xr(env, 'POST', '/api/v1/withdrawals', { ...body, asset: 'USDT' });
+    const biz = /(balance|min|address|duplicate|network|limit|amount|fee)/i;
+    if (r.s === 400 && !biz.test(xrType(r.j))) r = await xr(env, 'POST', '/api/v1/withdrawals', { ...body, currency: 'USDT' });
+    const dup = xrType(r.j) === 'withdrawal_duplicate';
+    if (!((r.s >= 200 && r.s < 300) || dup)) {
+      const t = xrType(r.j); console.log('xr_wd_fail', r.s, t);
+      if (r.s === 400 && /(address|min|amount_less|amount_too|invalid|network|small)/i.test(t) && !/more_than/i.test(t)) return refund('refused:' + t); /* permanent refusal: nothing was sent */
+      if (r.s >= 400 && r.s < 500 && r.s !== 429) { await db.prepare('UPDATE payout_day SET cents = MAX(0, cents - ?2) WHERE day = ?1').bind(day(), cents).run(); await upd(row.tries + 1 >= XR.MAX_TRIES ? 'hold' : 'new', t || ('http_' + r.s)); }
+      return 'pending'; /* network error / 429 / 5xx / balance too low: stays queued, the same clientWithdrawalId is retried */
+    }
+    const xid = xidOf(r); await upd('accepted', 'accepted', xid);
+    if (FIN.test(stOf(r))) return done(xid);
+    if (BAD.test(stOf(r))) return refund('failed:' + stOf(r));
+    return 'pending'; /* on-chain transfers take a moment: the cron asks xRocket for the final status */
+  }
+  if (row.status === 'accepted') { /* poll the final status */
+    const r = await xr(env, 'GET', '/api/v1/withdrawal?clientWithdrawalId=' + encodeURIComponent(ref));
+    if (!(r.s >= 200 && r.s < 300)) return 'pending';
+    if (FIN.test(stOf(r))) return done(row.xr_id || xidOf(r));
+    if (BAD.test(stOf(r))) return refund('failed:' + stOf(r));
+  }
+  return 'pending';
 }
-async function payPending(env) { // cron: retry pending withdrawals (10 at a time)
+async function payPending(env) { // cron: retry / confirm pending withdrawals (10 at a time)
   if (!env.DB || !env.XROCKET_TOKEN) return;
-  const r = await sb(env, 'withdrawals?status=eq.pending&select=id,player_id,usd,players(telegram_id)&order=id.asc&limit=10'); if (!r.ok) { console.log('paypend_db', r.status); return; }
-  for (const w of await r.json()) { try { await payWithdrawal(env, { id: w.id, pid: w.player_id, tid: w.players && w.players.telegram_id, usd: Number(w.usd) }); } catch (e) { console.log('pay_err', String(e && e.message)); } }
+  const r = await sb(env, 'withdrawals?status=eq.pending&select=id,player_id,usd,addr,players(telegram_id)&order=id.asc&limit=10'); if (!r.ok) { console.log('paypend_db', r.status); return; }
+  for (const w of await r.json()) { try { await payWithdrawal(env, { id: w.id, pid: w.player_id, tid: w.players && w.players.telegram_id, usd: Number(w.usd), addr: w.addr }); } catch (e) { console.log('pay_err', String(e && e.message)); } }
 }
 async function autoRotate(env) { try { const r = await sb(env, 'rpc/auto_rotate_season', { method: 'POST', body: '{}' }); if (!r.ok) console.log('rotate_db', r.status); } catch (e) { console.log('rotate_err'); } }
 
@@ -521,19 +550,28 @@ export default {
         if (P === '/ranked' && req.method === 'GET') {
           const r = await sb(env, 'rpc/get_ranked', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) });
           if (!r.ok) { console.log('ranked_db', r.status); return J({ e: 'err' }, 502, cors); }
-          const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
+          const j = await r.json(); if (!j || !j.ok) return J({ e: 'err' }, 404, cors);
+          const tot = async (sid) => { /* total Season Points of ALL players for a season, cached 60 s (one DB read per minute, not one per player) */
+            if (!Number.isInteger(sid)) return null; const k = 'rbr:sptot:' + sid; let v = await env.RL.get(k);
+            if (v === null) { const q = await sb(env, 'rpc/sp_total', { method: 'POST', body: JSON.stringify({ p: { sid } }) }); if (!q.ok) return null; const qj = await q.json(); v = JSON.stringify({ t: Number(qj && qj.total) || 0, n: Number(qj && qj.players) || 0 }); await env.RL.put(k, v, { expirationTtl: 60 }); }
+            try { return JSON.parse(v); } catch { return null; }
+          };
+          const cur = await tot(j.season && j.season.id); if (cur) { j.total_sp = cur.t; j.sp_players = cur.n; }
+          if (j.store && Number.isInteger(j.store.season)) { const st = await tot(j.store.season); if (st) j.store.total = st.t; }
+          j.now = Date.now(); return J(j, 200, cors);
         }
         if (req.method !== 'POST' || P === '/ranked') return new Response(null, { status: 405 });
         let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
-        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'sp') || !Number.isInteger(b.sp) || b.sp < 1 || b.sp > 10000000) return J({ e: 'bad' }, 400, cors);
-        const r = await sb(env, 'rpc/' + (P === '/sp/gems' ? 'sp_buy_gems' : 'sp_withdraw'), { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid, sp: b.sp } }) });
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'sp' && !(k === 'addr' && P === '/sp/withdraw')) || !Number.isInteger(b.sp) || b.sp < 1 || b.sp > 10000000) return J({ e: 'bad' }, 400, cors);
+        let ak = null; if (P === '/sp/withdraw') { ak = tonAddr(typeof b.addr === 'string' ? b.addr.trim() : '', isTestnet(env)); if (!ak) return J({ e: 'addr' }, 400, cors); b.addr = b.addr.trim(); } /* strict: wrong checksum / network / format never reaches the database */
+        const r = await sb(env, 'rpc/' + (P === '/sp/gems' ? 'sp_buy_gems' : 'sp_withdraw'), { method: 'POST', body: JSON.stringify({ p: P === '/sp/gems' ? { pid: ses.pid, sp: b.sp } : { pid: ses.pid, sp: b.sp, addr: b.addr, key: ak.key } }) });
         if (!r.ok) { console.log('sp_db', r.status); return J({ e: 'err' }, 502, cors); }
         const j = await r.json();
         if (j.ok) {
-          if (P === '/sp/withdraw' && Number.isInteger(j.wid)) { try { j.paid = (await payWithdrawal(env, { id: j.wid, pid: ses.pid, tid: ses.tid, usd: Number(j.usd) })) === 'paid' ? 1 : 0; } catch (e) { console.log('pay_err', String(e && e.message)); j.paid = 0; } }
+          if (P === '/sp/withdraw' && Number.isInteger(j.wid)) { try { const st = await payWithdrawal(env, { id: j.wid, pid: ses.pid, tid: ses.tid, usd: Number(j.usd), addr: b.addr }); j.paid = st === 'paid' ? 1 : 0; if (st === 'refunded') { j.refunded = 1; } } catch (e) { console.log('pay_err', String(e && e.message)); j.paid = 0; } }
           return J(j, 200, cors);
         }
-        return J({ e: j.e || 'err' }, j.e === 'bad' ? 400 : j.e === 'player' ? 404 : 409, cors);
+        return J({ e: j.e || 'err' }, j.e === 'bad' || j.e === 'addr' ? 400 : j.e === 'player' ? 404 : 409, cors);
       }
       if (P === '/gemad' || P === '/gemad/claim' || P === '/match/double') { /* free-gem ad in the shop (1 GEM, 5/day, 5 min cooldown) and DOUBLE COINS after a match: both need a server-verified AdsGram credit of their own kind */
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
@@ -858,7 +896,7 @@ export class MatchRoom {
     if (!p.pend && p.lq > 0) this.offer(p);
   }
   offer(p) { // server generates 3 random boosts (stack cap 3), server validates the pick
-    const ok = []; for (let i = 0; i < 8; i++) if (p.b[i] < 3) ok.push(i);
+    const ok = []; for (const i of [1, 2, 4, 5, 6, 7]) if (p.b[i] < 3) ok.push(i); /* ids 0 (damage) and 3 (fire rate) are not offered any more */
     if (!ok.length) { p.lq = 0; return; }
     for (let i = ok.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [ok[i], ok[j]] = [ok[j], ok[i]]; }
     p.pend = ok.slice(0, 3); this.send(p.ws, [5, p.lvl, p.pend]);
@@ -1149,11 +1187,11 @@ export class MatchRoom {
   pxpOut(p) { return Math.min(130, Math.round(seasonXp(this.mode, p.place || 1) * (p.prem ? 1.2 : 1))); } /* Premium: +20% Pass XP */
   finalize(o) { /* RP: every team in the match counts as an opponent (bots included), every kill counts, the MATCH SCORE bonus always applies, no halving */
     const sc = Math.round(this.score(o)), rk = !!(this.ranked && o.pid), sp = rk; let rp = 0, spg = 0;
-    if (rk) { rp = rankDelta({ ranked: true, th: this.teams, ph: o.lp || o.place || 1, kills: o.kills, score: sc, engaged: true, mode: this.mode }); spg = Math.min(100, Math.round(Math.max(0, rp) * (o.prem ? 1.2 : 1))); } /* Premium: +20% Season Points */
+    if (rk) { rp = rankDelta({ ranked: true, th: this.teams, ph: o.lp || o.place || 1, kills: o.kills, score: sc, engaged: true, mode: this.mode }); spg = Math.min(150, Math.round((Math.max(0, rp) + 2.5 * (o.lvl - 1)) * (o.prem ? 1.2 : 1))); } /* Premium: +20% Season Points */
     o.f = { sc, rk, sp, hp: o.hplace || 1, rp, spg };
   }
   zoneProg(el) { /* 0..5: how far the zone sequence has progressed (each phase counts 1, fractions inside a phase) */ let t = el; for (let i = 0; i < C.PHASES.length; i++) { const d = C.PHASES[i][0] + C.PHASES[i][1]; if (t < d) return i + t / d; t -= d; } return C.PHASES.length; }
-  score(p) { /* MATCH SCORE: starts at 30; every source is capped (zone 25, kills 10, damage 8, assists 6, placement 17 => max 96) */ return Math.min(100, 30 + Math.min(25, p.zs) + Math.min(10, p.ksc) + Math.min(8, p.dmgS / 125) + Math.min(6, p.asc) + Math.min(17, p.ps)); }
+  score(p) { /* MATCH SCORE: starts at 30; every source is capped (zone 25, kills 10, damage 8, assists 6, placement 17 => max 96) */ return Math.min(100, 30 + Math.min(25, p.zs) + Math.min(10, p.ksc) + Math.min(8, p.dmgS / 125) + Math.min(6, p.asc) + Math.min(17, p.ps) + Math.min(22.5, 2.5 * (p.lvl - 1))); }
   res(o, fin, now) { /* death message: [2, place, kills, final, damage, xp, reward coins, survived s, teams]; same numbers persist() writes at match end */ return [2, o.place, o.kills, fin, Math.round(o.dmg), this.xpOut(o), this.rwOut(o, o.f ? o.f.sc : Math.round(this.score(o))), Math.round(((o.dieAt || now) - this.startAt) / 1000), this.teams, o.f ? o.f.sc : Math.round(this.score(o)), o.f ? o.f.rp : 0, o.f && o.f.rk ? 1 : 0, o.f && o.f.sp ? 1 : 0, this.pxpOut(o)]; }
   specOf(h) { /* dead player in duo/squad: follow a living teammate (shows exactly what that teammate already sees) */
     const l = []; for (const m of (this.tl && this.tl[h.team - 1]) || []) if (m !== h && m.alive) l.push(m);
