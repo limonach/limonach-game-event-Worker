@@ -49,6 +49,10 @@ binding = "DB"
 database_name = "robot-br-fin"
 database_id = "1df3d35b-fc94-4804-993b-c71c44c8178c"
 
+[[r2_buckets]]
+binding = "BACKUP"
+bucket_name = "save-supabase-limonachgame"   # daily backup (backup.js). The bucket must exist, otherwise the deploy fails.
+
 [triggers]
 crons = ["*/10 * * * *", "0 6 * * *"]   # retries failed match writes + pending USDT payouts + auto seasons + Telegram webhook check; daily Supabase keep-alive
 

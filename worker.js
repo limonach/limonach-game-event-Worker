@@ -1,6 +1,8 @@
 // ROBOT BATTLE ROYALE - Stage 3 - worker.js
 // Role: API gateway (/auth /join /party/* /leave /stats /ws), Matchmaker DO (queues + parties), MatchRoom DO (one match per DO), Supabase writes at match end.
-// Commit as worker.js next to wrangler.toml. Secrets: JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN.
+import { ADMIN_HTML } from './admin.js';
+import { backupTick, backupStatus } from './backup.js';
+// Commit as worker.js next to wrangler.toml (together with admin.js and backup.js). Secrets: JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN.
 
 const C = {
   TICK_HZ: 20, SNAP_EVERY: 2,                 // TUNE: 20Hz sim, 10Hz snapshots
@@ -316,10 +318,38 @@ async function tgMaintain(env) { // cron: cancel stale orders, make sure Telegra
   if (r.j && r.j.ok === true) await env.RL.put(key, '1', { expirationTtl: 86400 }); else console.log('tg_setwebhook_fail', r.s, String((r.j && r.j.description) || '').slice(0, 80));
 }
 const esc = (q) => q.replace(/[\\%_]/g, '\\$&');
+const ADMIN_X = new Set(['/admin/overview', '/admin/wdh', '/admin/xr', '/admin/player', '/admin/suspects', '/admin/backup']);
+const NAME_OK = /^[\p{L}\p{N} _-]{1,24}$/u;
+async function admExtra(req, env, url, P) { // dashboard endpoints (already authenticated + rate-limited by admPay)
+  if (!ADMIN_X.has(P)) return null;
+  const get = async (path) => { const r = await sb(env, path); return r.ok ? r.json() : null; };
+  if (P === '/admin/overview') {
+    const r = await sb(env, 'rpc/admin_overview', { method: 'POST', body: JSON.stringify({ p: {} }) });
+    if (!r.ok) { console.log('adm_overview', r.status); return J({ e: 'db' }, 502); }
+    return J({ o: await r.json(), li: (await get('season_liability?select=season,name,value,players,sp_total,sp_open,max_open_usd&order=season.desc&limit=3')) || [] });
+  }
+  if (P === '/admin/wdh') return J({ rows: (await get('withdrawals?status=in.(paid,rejected)&select=id,sp,usd,status,note,paid_at,created_at,players(name)&order=id.desc&limit=30')) || [] });
+  if (P === '/admin/xr') return J({ rows: ((await env.DB.prepare('SELECT ref, gems, usd_cents, status, created_at, paid_at FROM orders ORDER BY created_at DESC LIMIT 20').all()).results) || [] });
+  if (P === '/admin/suspects') return J({ rows: (await get('suspect_summary?select=player_id,name,banned,matches_flagged,score,kinds,last_seen&order=score.desc&limit=30')) || [] });
+  if (P === '/admin/backup') return J(req.method === 'POST' ? await backupTick(env, sb, 'force') : await backupStatus(env));
+  if (P === '/admin/player') {
+    if (req.method === 'POST') {
+      let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
+      if (!b || typeof b.id !== 'string' || !UUID.test(b.id) || typeof b.banned !== 'boolean' || Object.keys(b).length !== 2) return J({ e: 'bad' }, 400);
+      const r = await sb(env, 'players?id=eq.' + b.id, { method: 'PATCH', headers: { Prefer: 'return=minimal' }, body: JSON.stringify({ banned: b.banned }) });
+      console.log('admin_ban', b.id, b.banned, r.status); return r.ok ? J({ ok: 1 }) : J({ e: 'db' }, 502);
+    }
+    const q = (url.searchParams.get('q') || '').trim().slice(0, 40); let f = '';
+    if (/^[0-9]{1,15}$/.test(q)) f = '&telegram_id=eq.' + q; else if (UUID.test(q)) f = '&id=eq.' + q; else if (NAME_OK.test(q)) f = '&name=ilike.' + encodeURIComponent('*' + q + '*'); else if (q) return J({ rows: [] });
+    return J({ rows: (await get('players?select=id,telegram_id,name,level,total_xp,soft_currency,premium_currency,banned,created_at' + f + '&order=total_xp.desc&limit=20')) || [] });
+  }
+  return null;
+}
 async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-admin header = ADMIN_KEY)
-  if (!(await rl(env, 'adm:' + ip, 20))) return J({ e: 'slow' }, 429);
+  if (!(await rl(env, 'adm:' + ip, 40))) return J({ e: 'slow' }, 429);
   if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
   if (!env.DB) return J({ e: 'nodb' }, 503);
+  { const ex = await admExtra(req, env, url, P); if (ex) return ex; }
   if (P === '/admin/wd') { /* pending USDT withdrawal requests: the owner pays them by hand, then marks them paid (or rejects = the Season Points come back) */
     if (req.method === 'POST') {
       let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
@@ -345,7 +375,6 @@ async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-ad
     : (await db.prepare('SELECT order_id, tid, username, first_name, gems, stars, charge_id, status, refund_status, refund_reason, created_at, paid_at FROM star_orders ORDER BY created_at DESC LIMIT 20').all()).results;
   return J({ stars: t, xrocket: x, rows });
 }
-const ADMIN_HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay admin</title><style>body{font:14px system-ui;background:#0b1220;color:#fff;margin:0;padding:10px}input,button{font-size:15px;padding:8px;margin:3px 3px 3px 0;border-radius:8px;border:1px solid #2bd;background:#012;color:#fff;box-sizing:border-box}button{background:#18a}#k,#q{width:100%}.g{display:grid;grid-template-columns:1fr 1fr;gap:6px}.c{background:#122;border-radius:8px;padding:8px}.c b{display:block;font-size:18px;color:#ffd166}.o{background:#122;border-radius:8px;padding:8px;margin:6px 0;word-break:break-all;font-size:12px}h3{margin:14px 0 4px;color:#ffd166}</style></head><body><input id="k" type="password" placeholder="ADMIN_KEY" autocomplete="off"><input id="q" placeholder="Telegram ID / username / Order ID / Charge ID"><button id="go">LOAD / SEARCH (Stars)</button><button id="wdb">WITHDRAWALS</button><h3>Withdrawal requests (pay by hand, then mark)</h3><div id="wds"></div><h3>Stars orders</h3><div id="st" class="g"></div><div id="rows"></div><script>const $=id=>document.getElementById(id);async function call(p,o){o=o||{};o.headers=Object.assign({"x-admin":$("k").value},o.headers||{});const r=await fetch(p,o);if(r.status===404)throw new Error("wrong key");return r.json()}function card(a,b){const d=document.createElement("div");d.className="c";d.textContent=a;const x=document.createElement("b");x.textContent=b;d.appendChild(x);return d}async function load(){try{const j=await call("/admin/pay?q="+encodeURIComponent($("q").value));const s=j.stars,x=j.xrocket,S=$("st");S.textContent="";[["Total orders",s.total],["Successful",s.ok],["Pending",s.pending],["Cancelled",s.cancelled],["Refunded",s.refunded],["Stars received",s.stars_in],["Stars refunded",s.stars_refunded],["GEM sold",s.gems_sold],["GEM refunded",s.gems_refunded],["xRocket paid orders",x.paid],["xRocket USD",(x.cents/100).toFixed(2)],["xRocket GEM",x.gems]].forEach(a=>S.appendChild(card(a[0],a[1])));const R=$("rows");R.textContent="";j.rows.forEach(o=>{const d=document.createElement("div");d.className="o";d.textContent=o.order_id+" | tg "+o.tid+" | @"+(o.username||"-")+" | "+o.gems+" GEM | "+o.stars+" Stars | "+o.status+(o.refund_status?" | refund "+o.refund_status:"")+" | "+new Date(o.created_at).toISOString().slice(0,16)+" | charge "+(o.charge_id||"-")+(o.refund_reason?" | "+o.refund_reason:"");if(o.charge_id&&o.refund_status!=="REFUNDED"){const b=document.createElement("button");b.textContent="REFUND";b.onclick=async()=>{const why=prompt("Refund reason");if(why===null||!confirm("Refund "+o.stars+" Stars to tg "+o.tid+"?"))return;const r=await call("/admin/refund",{method:"POST",body:JSON.stringify({order_id:o.order_id,reason:why})});alert(JSON.stringify(r));load()};d.appendChild(document.createElement("br"));d.appendChild(b)}R.appendChild(d)})}catch(e){alert(e.message)}}async function loadWd(){try{const j=await call("/admin/wd");const W=$("wds");W.textContent="";if(!j.rows.length){W.textContent="No pending withdrawals";return}j.rows.forEach(w=>{const d=document.createElement("div");d.className="o";d.textContent="#"+w.id+" | "+(w.name||"-")+" | tg "+(w.telegram_id||"-")+" | $"+w.usd+" | "+w.sp+" SP | suspect score "+(w.score||0)+(w.kinds?" ("+w.kinds.join(",")+")":"")+" | "+new Date(w.created_at).toISOString().slice(0,16)+" | USDT (TON) address: "+w.addr;const p=document.createElement("button");p.textContent="MARK PAID";p.onclick=async()=>{const tx=prompt("Transaction hash / note");if(tx===null)return;const r=await call("/admin/wd",{method:"POST",body:JSON.stringify({id:w.id,action:"paid",note:tx})});alert(JSON.stringify(r));loadWd()};const x=document.createElement("button");x.textContent="REJECT + REFUND SP";x.onclick=async()=>{const why=prompt("Reason");if(why===null||!confirm("Give the Season Points of #"+w.id+" back?"))return;const r=await call("/admin/wd",{method:"POST",body:JSON.stringify({id:w.id,action:"reject",note:why})});alert(JSON.stringify(r));loadWd()};d.appendChild(document.createElement("br"));d.appendChild(p);d.appendChild(x);W.appendChild(d)})}catch(e){alert(e.message)}}$("go").onclick=load;$("wdb").onclick=loadWd</script></body></html>`;
 async function myPayments(env, ses, cors) {
   if (!env.DB) return J({ items: [] }, 200, cors);
   const a = (await env.DB.prepare("SELECT order_id, pack, gems, stars, charge_id, status, refund_status, created_at FROM star_orders WHERE pid = ?1 AND status IN ('PAID','DELIVERED','REFUNDED') ORDER BY created_at DESC LIMIT 10").bind(ses.pid).all()).results || [];
@@ -402,7 +431,7 @@ const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
 const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
 
 export default {
-  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), autoRotate(env), tgMaintain(env).catch((e) => console.log('tgm_err', String(e && e.message))), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
+  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), autoRotate(env), tgMaintain(env).catch((e) => console.log('tgm_err', String(e && e.message))), event.cron === '*/10 * * * *' ? backupTick(env, sb, 'run').catch((e) => console.log('backup_err', String(e && e.message))) : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
   async fetch(req, env) {
     const url = new URL(req.url), origin = req.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean), okOrigin = allowed.includes(origin);
@@ -431,7 +460,7 @@ export default {
       }
       if (P === '/tg/webhook' && req.method === 'POST') return tgHook(req, env); /* Telegram bot webhook, authenticated by the secret-token header */
       if (P === '/admin/ui' && req.method === 'GET') return new Response(ADMIN_HTML, { headers: { 'content-type': 'text/html; charset=utf-8', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'cache-control': 'no-store', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'" } });
-      if (P === '/admin/pay' || P === '/admin/refund' || P === '/admin/wd') return admPay(req, env, url, ip, P);
+      if (P === '/admin/pay' || P === '/admin/refund' || P === '/admin/wd' || ADMIN_X.has(P)) return admPay(req, env, url, ip, P);
       if (P === '/xrocket/webhook' && req.method === 'POST') return xrHook(req, env, ip); /* server-to-server, no Origin header, authenticated by HMAC signature */
       if (!okOrigin) return new Response(null, { status: 403 });
 
