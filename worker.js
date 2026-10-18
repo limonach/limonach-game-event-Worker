@@ -58,6 +58,14 @@ const WPN = [
   { id: 'dbs', c: 'sg', dmg: 5, cd: 800, sp: 1200, rg: 150, n: 4, spr: 9, bu: 2, gp: 50 }];
 const WPN_IDX = Object.fromEntries(WPN.map((x, i) => [x.id, i]));
 const wpnRow = (x) => [x.id, x.c, x.dmg, x.cd, x.sp, x.rg, x.n, x.spr, x.bu, x.gp];
+
+// ---------- SKILLS: up to 4 per player, ONE per category, chosen in the lobby, used in the match with a cooldown ----------
+// c = category, cd = cooldown seconds, d = effect seconds. All numbers are TUNE values; sizes/distances are in the SK_* constants below.
+const SKCAT = [['sh', 'cv', 'rc'], ['ds', 'sp', 'vb'], ['sc', 'rd', 'ls'], ['sm', 'sf', 'ss']]; /* defense, movement, recon, tactical */
+const SK = { sh: { cd: 45, d: 5 }, cv: { cd: 60, d: 10 }, rc: { cd: 50, d: 5 }, ds: { cd: 25, d: 0 }, sp: { cd: 40, d: 6 }, vb: { cd: 40, d: 6 }, sc: { cd: 50, d: 4 }, rd: { cd: 45, d: 6 }, ls: { cd: 30, d: 8 }, sm: { cd: 35, d: 8 }, sf: { cd: 45, d: 5 }, ss: { cd: 45, d: 7 } };
+const SK_C = { SHIELD_HP: 75, HEAL: 50, HEAL_PER_S: 10, DASH: 260, SPRINT: 1.2, BOOST: 1.25, SCAN_R: 900, RADAR_R: 3000, LOOT_R: 1000, SMOKE_R: 140, SMOKE_AHEAD: 100, SLOW_R: 220, SLOW: 0.75, SILENT_SEE: 0.3, COVER_LONG: 110, COVER_THICK: 20, COVER_AHEAD: 70 };
+const parseSk = (s) => { if (typeof s !== 'string' || !/^[a-z]{0,2}(,[a-z]{0,2}){3}$/.test(s)) return null; const a = s.split(','); for (let i = 0; i < 4; i++) if (a[i] && !SKCAT[i].includes(a[i])) return null; return a; };
+const skRow = (code, i) => [code, i, SK[code].cd, SK[code].d];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const enc = new TextEncoder();
 const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -190,63 +198,6 @@ function tonAddr(s, testnet) { /* friendly TON address (48 chars, EQ.../UQ...): 
   return { key: (wc === 0xff ? '-1' : '0') + ':' + [...u.subarray(2, 34)].map((b) => b.toString(16).padStart(2, '0')).join('') };
 }
 const isTestnet = (env) => String(env.XROCKET_BASE || '').includes('testnet');
-async function payWithdrawal(env, w) { // w = { id, pid, tid, usd, addr }. Safe to call any number of times for the same withdrawal. Returns 'paid' | 'refunded' | 'pending'.
-  if (!env.DB || !env.XROCKET_TOKEN || typeof w.addr !== 'string' || !tonAddr(w.addr, isTestnet(env)) || !(w.usd >= 1)) return 'pending';
-  const ref = 'wd-' + w.id, cents = Math.round(w.usd * 100), now = Date.now(), db = env.DB, day = () => new Date().toISOString().slice(0, 10);
-  await db.prepare("INSERT OR IGNORE INTO payouts (ref, wid, pid, tid, usd_cents, status, tries, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'new', 0, ?6, ?6)").bind(ref, w.id, w.pid, Number(w.tid) || 0, cents, now).run();
-  const row = await db.prepare('SELECT status, tries, xr_id FROM payouts WHERE ref = ?1').bind(ref).first(); if (!row) return 'pending';
-  const upd = (st, note, xid) => db.prepare('UPDATE payouts SET status = ?2, note = ?3, xr_id = COALESCE(?4, xr_id), tries = tries + ?5, updated_at = ?6 WHERE ref = ?1').bind(ref, st, String(note || '').slice(0, 80), xid || null, st === 'new' ? 1 : 0, Date.now()).run();
-  const refund = async (note) => { /* a definite refusal: give the Season Points back (idempotent, only for still-pending requests) */
-    await db.prepare('UPDATE payout_day SET cents = MAX(0, cents - ?2) WHERE day = ?1').bind(day(), cents).run();
-    const f = await sb(env, 'rpc/refund_withdrawal', { method: 'POST', body: JSON.stringify({ p: { wid: w.id, note: String(note).slice(0, 100) } }) });
-    if (!f.ok) { console.log('refund_wd_db', f.status); return 'pending'; } await upd('failed', note); return 'refunded';
-  };
-  const done = async (xid) => { await upd('paid', 'ok', xid); const f = await sb(env, 'rpc/finish_withdrawal', { method: 'POST', body: JSON.stringify({ p: { wid: w.id, note: 'xrocket:' + xid } }) }); if (!f.ok) console.log('finish_wd_db', f.status); return 'paid'; };
-  const FIN = /^(finished|completed|success|succeeded|done|paid)$/i, BAD = /^(failed|canceled|cancelled|rejected|error|declined)$/i;
-  const stOf = (r) => String((r.j && (r.j.status || (r.j.data && r.j.data.status))) || '');
-  const xidOf = (r) => String((r.j && (r.j.withdrawalId || r.j.id || (r.j.data && (r.j.data.withdrawalId || r.j.data.id)))) || '');
-  if (row.status === 'hold') return 'pending'; /* manual review: set status back to 'new' in D1 to release it */
-  if (row.status === 'paid') return done(row.xr_id || '');
-  if (row.status === 'failed') return 'refunded';
-  if (row.status === 'new') { /* first attempt: guards, then reserve the daily cap */
-    if (cents > XR.MAX_PAYOUT_USD * 100) { await upd('hold', 'over_limit'); return 'pending'; }
-    const sr = await sb(env, 'suspect_summary?player_id=eq.' + w.pid + '&select=score'); if (!sr.ok) return 'pending'; /* fail closed */
-    const sc = Number(((await sr.json())[0] || {}).score) || 0; if (sc >= XR.HOLD_SCORE) { await upd('hold', 'suspect_' + sc); return 'pending'; }
-    const rs = await db.prepare('INSERT INTO payout_day (day, cents) VALUES (?1, ?2) ON CONFLICT(day) DO UPDATE SET cents = cents + ?2 WHERE cents + ?2 <= ?3').bind(day(), cents, XR.DAILY_CAP_USD * 100).run();
-    if (!rs.meta || !rs.meta.changes) return 'pending'; /* daily cap reached: the cron retries tomorrow */
-    await upd('sent', 'reserved'); /* 'sent' = cap reserved, the xRocket call may or may not have happened */
-  }
-  if (row.status === 'new' || row.status === 'sent') {
-    /* the exact field names of POST /api/v1/withdrawals are not in the public page, so a validation-type 400 retries once with the alternative spelling; clientWithdrawalId makes every attempt idempotent */
-    const body = { clientWithdrawalId: ref, network: 'TON', address: w.addr, amount: (cents / 100).toFixed(2), comment: 'Robot BR season reward' };
-    let r = await xr(env, 'POST', '/api/v1/withdrawals', { ...body, asset: 'USDT' });
-    const biz = /(balance|min|address|duplicate|network|limit|amount|fee)/i;
-    if (r.s === 400 && !biz.test(xrType(r.j))) r = await xr(env, 'POST', '/api/v1/withdrawals', { ...body, currency: 'USDT' });
-    const dup = xrType(r.j) === 'withdrawal_duplicate';
-    if (!((r.s >= 200 && r.s < 300) || dup)) {
-      const t = xrType(r.j); console.log('xr_wd_fail', r.s, t);
-      if (r.s === 400 && /(address|min|amount_less|amount_too|invalid|network|small)/i.test(t) && !/more_than/i.test(t)) return refund('refused:' + t); /* permanent refusal: nothing was sent */
-      if (r.s >= 400 && r.s < 500 && r.s !== 429) { await db.prepare('UPDATE payout_day SET cents = MAX(0, cents - ?2) WHERE day = ?1').bind(day(), cents).run(); await upd(row.tries + 1 >= XR.MAX_TRIES ? 'hold' : 'new', t || ('http_' + r.s)); }
-      return 'pending'; /* network error / 429 / 5xx / balance too low: stays queued, the same clientWithdrawalId is retried */
-    }
-    const xid = xidOf(r); await upd('accepted', 'accepted', xid);
-    if (FIN.test(stOf(r))) return done(xid);
-    if (BAD.test(stOf(r))) return refund('failed:' + stOf(r));
-    return 'pending'; /* on-chain transfers take a moment: the cron asks xRocket for the final status */
-  }
-  if (row.status === 'accepted') { /* poll the final status */
-    const r = await xr(env, 'GET', '/api/v1/withdrawal?clientWithdrawalId=' + encodeURIComponent(ref));
-    if (!(r.s >= 200 && r.s < 300)) return 'pending';
-    if (FIN.test(stOf(r))) return done(row.xr_id || xidOf(r));
-    if (BAD.test(stOf(r))) return refund('failed:' + stOf(r));
-  }
-  return 'pending';
-}
-async function payPending(env) { // cron: retry / confirm pending withdrawals (10 at a time)
-  if (!env.DB || !env.XROCKET_TOKEN) return;
-  const r = await sb(env, 'withdrawals?status=eq.pending&select=id,player_id,usd,addr,players(telegram_id)&order=id.asc&limit=10'); if (!r.ok) { console.log('paypend_db', r.status); return; }
-  for (const w of await r.json()) { try { await payWithdrawal(env, { id: w.id, pid: w.player_id, tid: w.players && w.players.telegram_id, usd: Number(w.usd), addr: w.addr }); } catch (e) { console.log('pay_err', String(e && e.message)); } }
-}
 async function autoRotate(env) { try { const r = await sb(env, 'rpc/auto_rotate_season', { method: 'POST', body: '{}' }); if (!r.ok) console.log('rotate_db', r.status); } catch (e) { console.log('rotate_err'); } }
 
 // ---------- Telegram Stars (XTR): digital goods paid inside Telegram ----------
@@ -369,6 +320,19 @@ async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-ad
   if (!(await rl(env, 'adm:' + ip, 20))) return J({ e: 'slow' }, 429);
   if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
   if (!env.DB) return J({ e: 'nodb' }, 503);
+  if (P === '/admin/wd') { /* pending USDT withdrawal requests: the owner pays them by hand, then marks them paid (or rejects = the Season Points come back) */
+    if (req.method === 'POST') {
+      let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
+      if (!b || !Number.isInteger(b.id) || (b.action !== 'paid' && b.action !== 'reject')) return J({ e: 'bad' }, 400);
+      const note = String(b.note || '').slice(0, 100); console.log('admin_wd', b.id, b.action);
+      const r = await sb(env, 'rpc/' + (b.action === 'paid' ? 'finish_withdrawal' : 'refund_withdrawal'), { method: 'POST', body: JSON.stringify({ p: { wid: b.id, note: (b.action === 'paid' ? 'manual:' : 'rejected:') + note } }) });
+      return r.ok ? J(await r.json()) : J({ e: 'db' }, 502);
+    }
+    const r = await sb(env, 'withdrawals?status=eq.pending&select=id,player_id,sp,usd,addr,created_at,players(name,telegram_id)&order=id.asc&limit=50'); if (!r.ok) return J({ e: 'db' }, 502);
+    const rows = await r.json(), ids = [...new Set(rows.map((x) => x.player_id))], sc = {};
+    if (ids.length) { const s = await sb(env, 'suspect_summary?player_id=in.(' + ids.join(',') + ')&select=player_id,score,kinds'); if (s.ok) for (const x of await s.json()) sc[x.player_id] = x; }
+    return J({ rows: rows.map((x) => ({ id: x.id, name: x.players && x.players.name, telegram_id: x.players && x.players.telegram_id, sp: x.sp, usd: Number(x.usd), addr: x.addr, created_at: Date.parse(x.created_at), score: sc[x.player_id] ? Number(sc[x.player_id].score) : 0, kinds: sc[x.player_id] ? sc[x.player_id].kinds : null })) });
+  }
   if (P === '/admin/refund') {
     let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
     if (req.method !== 'POST' || !b || typeof b.order_id !== 'string') return J({ e: 'bad' }, 400);
@@ -381,7 +345,7 @@ async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-ad
     : (await db.prepare('SELECT order_id, tid, username, first_name, gems, stars, charge_id, status, refund_status, refund_reason, created_at, paid_at FROM star_orders ORDER BY created_at DESC LIMIT 20').all()).results;
   return J({ stars: t, xrocket: x, rows });
 }
-const ADMIN_HTML = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay admin</title><style>body{font:14px system-ui;background:#0b1220;color:#fff;margin:0;padding:10px}input,button{font-size:15px;padding:8px;margin:3px 0;border-radius:8px;border:1px solid #2bd;background:#012;color:#fff;box-sizing:border-box}button{background:#18a}#k,#q{width:100%}.g{display:grid;grid-template-columns:1fr 1fr;gap:6px}.c{background:#122;border-radius:8px;padding:8px}.c b{display:block;font-size:18px;color:#ffd166}.o{background:#122;border-radius:8px;padding:8px;margin:6px 0;word-break:break-all;font-size:12px}</style></head><body><input id="k" type="password" placeholder="ADMIN_KEY" autocomplete="off"><input id="q" placeholder="Telegram ID / username / Order ID / Charge ID"><button id="go">LOAD / SEARCH</button><div id="st" class="g"></div><div id="rows"></div><script>const $=id=>document.getElementById(id);async function call(p,o){o=o||{};o.headers=Object.assign({"x-admin":$("k").value},o.headers||{});const r=await fetch(p,o);if(r.status===404)throw new Error("wrong key");return r.json()}function card(a,b){const d=document.createElement("div");d.className="c";d.textContent=a;const x=document.createElement("b");x.textContent=b;d.appendChild(x);return d}async function load(){try{const j=await call("/admin/pay?q="+encodeURIComponent($("q").value));const s=j.stars,x=j.xrocket,S=$("st");S.textContent="";[["Total orders",s.total],["Successful",s.ok],["Pending",s.pending],["Cancelled",s.cancelled],["Refunded",s.refunded],["Stars received",s.stars_in],["Stars refunded",s.stars_refunded],["GEM sold",s.gems_sold],["GEM refunded",s.gems_refunded],["xRocket paid orders",x.paid],["xRocket USD",(x.cents/100).toFixed(2)],["xRocket GEM",x.gems]].forEach(a=>S.appendChild(card(a[0],a[1])));const R=$("rows");R.textContent="";j.rows.forEach(o=>{const d=document.createElement("div");d.className="o";d.textContent=o.order_id+" | tg "+o.tid+" | @"+(o.username||"-")+" | "+o.gems+" GEM | "+o.stars+" Stars | "+o.status+(o.refund_status?" | refund "+o.refund_status:"")+" | "+new Date(o.created_at).toISOString().slice(0,16)+" | charge "+(o.charge_id||"-")+(o.refund_reason?" | "+o.refund_reason:"");if(o.charge_id&&o.refund_status!=="REFUNDED"){const b=document.createElement("button");b.textContent="REFUND";b.onclick=async()=>{const why=prompt("Refund reason");if(why===null||!confirm("Refund "+o.stars+" Stars to tg "+o.tid+"?"))return;const r=await call("/admin/refund",{method:"POST",body:JSON.stringify({order_id:o.order_id,reason:why})});alert(JSON.stringify(r));load()};d.appendChild(document.createElement("br"));d.appendChild(b)}R.appendChild(d)})}catch(e){alert(e.message)}}$("go").onclick=load</script></body></html>';
+const ADMIN_HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay admin</title><style>body{font:14px system-ui;background:#0b1220;color:#fff;margin:0;padding:10px}input,button{font-size:15px;padding:8px;margin:3px 3px 3px 0;border-radius:8px;border:1px solid #2bd;background:#012;color:#fff;box-sizing:border-box}button{background:#18a}#k,#q{width:100%}.g{display:grid;grid-template-columns:1fr 1fr;gap:6px}.c{background:#122;border-radius:8px;padding:8px}.c b{display:block;font-size:18px;color:#ffd166}.o{background:#122;border-radius:8px;padding:8px;margin:6px 0;word-break:break-all;font-size:12px}h3{margin:14px 0 4px;color:#ffd166}</style></head><body><input id="k" type="password" placeholder="ADMIN_KEY" autocomplete="off"><input id="q" placeholder="Telegram ID / username / Order ID / Charge ID"><button id="go">LOAD / SEARCH (Stars)</button><button id="wdb">WITHDRAWALS</button><h3>Withdrawal requests (pay by hand, then mark)</h3><div id="wds"></div><h3>Stars orders</h3><div id="st" class="g"></div><div id="rows"></div><script>const $=id=>document.getElementById(id);async function call(p,o){o=o||{};o.headers=Object.assign({"x-admin":$("k").value},o.headers||{});const r=await fetch(p,o);if(r.status===404)throw new Error("wrong key");return r.json()}function card(a,b){const d=document.createElement("div");d.className="c";d.textContent=a;const x=document.createElement("b");x.textContent=b;d.appendChild(x);return d}async function load(){try{const j=await call("/admin/pay?q="+encodeURIComponent($("q").value));const s=j.stars,x=j.xrocket,S=$("st");S.textContent="";[["Total orders",s.total],["Successful",s.ok],["Pending",s.pending],["Cancelled",s.cancelled],["Refunded",s.refunded],["Stars received",s.stars_in],["Stars refunded",s.stars_refunded],["GEM sold",s.gems_sold],["GEM refunded",s.gems_refunded],["xRocket paid orders",x.paid],["xRocket USD",(x.cents/100).toFixed(2)],["xRocket GEM",x.gems]].forEach(a=>S.appendChild(card(a[0],a[1])));const R=$("rows");R.textContent="";j.rows.forEach(o=>{const d=document.createElement("div");d.className="o";d.textContent=o.order_id+" | tg "+o.tid+" | @"+(o.username||"-")+" | "+o.gems+" GEM | "+o.stars+" Stars | "+o.status+(o.refund_status?" | refund "+o.refund_status:"")+" | "+new Date(o.created_at).toISOString().slice(0,16)+" | charge "+(o.charge_id||"-")+(o.refund_reason?" | "+o.refund_reason:"");if(o.charge_id&&o.refund_status!=="REFUNDED"){const b=document.createElement("button");b.textContent="REFUND";b.onclick=async()=>{const why=prompt("Refund reason");if(why===null||!confirm("Refund "+o.stars+" Stars to tg "+o.tid+"?"))return;const r=await call("/admin/refund",{method:"POST",body:JSON.stringify({order_id:o.order_id,reason:why})});alert(JSON.stringify(r));load()};d.appendChild(document.createElement("br"));d.appendChild(b)}R.appendChild(d)})}catch(e){alert(e.message)}}async function loadWd(){try{const j=await call("/admin/wd");const W=$("wds");W.textContent="";if(!j.rows.length){W.textContent="No pending withdrawals";return}j.rows.forEach(w=>{const d=document.createElement("div");d.className="o";d.textContent="#"+w.id+" | "+(w.name||"-")+" | tg "+(w.telegram_id||"-")+" | $"+w.usd+" | "+w.sp+" SP | suspect score "+(w.score||0)+(w.kinds?" ("+w.kinds.join(",")+")":"")+" | "+new Date(w.created_at).toISOString().slice(0,16)+" | USDT (TON) address: "+w.addr;const p=document.createElement("button");p.textContent="MARK PAID";p.onclick=async()=>{const tx=prompt("Transaction hash / note");if(tx===null)return;const r=await call("/admin/wd",{method:"POST",body:JSON.stringify({id:w.id,action:"paid",note:tx})});alert(JSON.stringify(r));loadWd()};const x=document.createElement("button");x.textContent="REJECT + REFUND SP";x.onclick=async()=>{const why=prompt("Reason");if(why===null||!confirm("Give the Season Points of #"+w.id+" back?"))return;const r=await call("/admin/wd",{method:"POST",body:JSON.stringify({id:w.id,action:"reject",note:why})});alert(JSON.stringify(r));loadWd()};d.appendChild(document.createElement("br"));d.appendChild(p);d.appendChild(x);W.appendChild(d)})}catch(e){alert(e.message)}}$("go").onclick=load;$("wdb").onclick=loadWd</script></body></html>`;
 async function myPayments(env, ses, cors) {
   if (!env.DB) return J({ items: [] }, 200, cors);
   const a = (await env.DB.prepare("SELECT order_id, pack, gems, stars, charge_id, status, refund_status, created_at FROM star_orders WHERE pid = ?1 AND status IN ('PAID','DELIVERED','REFUNDED') ORDER BY created_at DESC LIMIT 10").bind(ses.pid).all()).results || [];
@@ -438,7 +402,7 @@ const mmStub = (env) => env.MM.get(env.MM.idFromName('mm'));
 const mmCall = async (env, path, body) => { const r = await mmStub(env).fetch('https://mm' + path, { method: 'POST', body: JSON.stringify(body) }); return [r.status, await r.json()]; };
 
 export default {
-  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), payPending(env), autoRotate(env), tgMaintain(env).catch((e) => console.log('tgm_err', String(e && e.message))), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
+  async scheduled(event, env, ctx) { ctx.waitUntil(Promise.all([flushPending(env), autoRotate(env), tgMaintain(env).catch((e) => console.log('tgm_err', String(e && e.message))), event.cron === '*/10 * * * *' ? null : keepAlive(env)])); }, /* the 10-minute job retries failed writes; the daily job pings Supabase */
   async fetch(req, env) {
     const url = new URL(req.url), origin = req.headers.get('Origin') || '';
     const allowed = (env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean), okOrigin = allowed.includes(origin);
@@ -467,17 +431,17 @@ export default {
       }
       if (P === '/tg/webhook' && req.method === 'POST') return tgHook(req, env); /* Telegram bot webhook, authenticated by the secret-token header */
       if (P === '/admin/ui' && req.method === 'GET') return new Response(ADMIN_HTML, { headers: { 'content-type': 'text/html; charset=utf-8', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'cache-control': 'no-store', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'" } });
-      if (P === '/admin/pay' || P === '/admin/refund') return admPay(req, env, url, ip, P);
+      if (P === '/admin/pay' || P === '/admin/refund' || P === '/admin/wd') return admPay(req, env, url, ip, P);
       if (P === '/xrocket/webhook' && req.method === 'POST') return xrHook(req, env, ip); /* server-to-server, no Origin header, authenticated by HMAC signature */
       if (!okOrigin) return new Response(null, { status: 403 });
 
       if (P === '/ws') {
         if (req.headers.get('Upgrade') !== 'websocket') return new Response(null, { status: 426 });
         const t = await rdTok(env, 'J1.', url.searchParams.get('t'));
-        if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n) || !/^[a-z0-9_,]{0,220}$/.test(t.cs || '') || !/^[\p{L}\p{N} _-]{0,24}$/u.test(t.nm || '') || (t.pm !== undefined && t.pm !== 0 && t.pm !== 1) || (t.wp !== undefined && WPN_IDX[t.wp] === undefined)) return new Response(null, { status: 401 });
+        if (!t || !/^[pg]:[0-9a-f-]{8,36}$/.test(t.u) || !(t.pid === null || UUID.test(t.pid)) || !UUID.test(t.m) || !K.TEAM[t.md] || !/^([A-Z2-9]{6})?$/.test(t.pt) || !/^[a-f0-9]{16}$/.test(t.n) || !/^[a-z0-9_,]{0,220}$/.test(t.cs || '') || !/^[\p{L}\p{N} _-]{0,24}$/u.test(t.nm || '') || (t.pm !== undefined && t.pm !== 0 && t.pm !== 1) || (t.wp !== undefined && WPN_IDX[t.wp] === undefined) || (t.sk !== undefined && !parseSk(t.sk))) return new Response(null, { status: 401 });
         const ipc = (await sign(env.JOIN_SECRET, 'ip|' + ip + '|' + t.m)).slice(0, 10); // salted per match: same-network detection inside one match, no raw IP stored anywhere
         const r2 = new Request(req);
-        for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)], ['x-ipc', ipc], ['x-cs', t.cs || ''], ['x-nm', encodeURIComponent(t.nm || '')], ['x-pm', t.pm ? '1' : ''], ['x-wp', t.wp || 'ar01']]) r2.headers.set(k, v);
+        for (const [k, v] of [['x-u', t.u], ['x-pid', t.pid || ''], ['x-m', t.m], ['x-md', t.md], ['x-pt', t.pt], ['x-nonce', t.n], ['x-exp', String(t.exp)], ['x-ipc', ipc], ['x-cs', t.cs || ''], ['x-nm', encodeURIComponent(t.nm || '')], ['x-pm', t.pm ? '1' : ''], ['x-wp', t.wp || 'ar01'], ['x-sk', t.sk || ',,,']]) r2.headers.set(k, v);
         return env.MATCH.get(env.MATCH.idFromName(t.m)).fetch(r2);
       }
 
@@ -568,7 +532,7 @@ export default {
         if (!r.ok) { console.log('sp_db', r.status); return J({ e: 'err' }, 502, cors); }
         const j = await r.json();
         if (j.ok) {
-          if (P === '/sp/withdraw' && Number.isInteger(j.wid)) { try { const st = await payWithdrawal(env, { id: j.wid, pid: ses.pid, tid: ses.tid, usd: Number(j.usd), addr: b.addr }); j.paid = st === 'paid' ? 1 : 0; if (st === 'refunded') { j.refunded = 1; } } catch (e) { console.log('pay_err', String(e && e.message)); j.paid = 0; } }
+          if (P === '/sp/withdraw') console.log('withdrawal_request', j.wid); /* nothing is paid here: the owner reviews it in /admin/ui and pays by hand */
           return J(j, 200, cors);
         }
         return J({ e: j.e || 'err' }, j.e === 'bad' || j.e === 'addr' ? 400 : j.e === 'player' ? 404 : 409, cors);
@@ -618,6 +582,21 @@ export default {
         const j = await r.json(); return j && j.ok ? J(j, 200, cors) : J({ e: 'err' }, 404, cors);
       }
       if (P === '/pass' || P === '/pass/claim' || P === '/pass/buy' || P === '/box/open') return passApi(env, ses, req, P, cors);
+      if (P === '/skills' || P === '/skills/equip') { /* SKILLS vault: one skill per category, up to 4; used from the NEXT match */
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        if (P === '/skills' && req.method === 'GET') {
+          let cur = ['', '', '', '']; const r = await sb(env, 'players?id=eq.' + ses.pid + '&select=skills'); if (r.ok) { const row = (await r.json())[0]; const a = row && parseSk(row.skills); if (a) cur = a; }
+          return J({ cur, list: SKCAT.flatMap((cat, i) => cat.map((code) => skRow(code, i))) }, 200, cors);
+        }
+        if (req.method !== 'POST' || P === '/skills') return new Response(null, { status: 405 });
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'sel') || !Array.isArray(b.sel) || b.sel.length !== 4 || b.sel.some((x) => typeof x !== 'string')) return J({ e: 'bad' }, 400, cors);
+        const s = b.sel.join(','); if (!parseSk(s)) return J({ e: 'bad' }, 400, cors);
+        const r = await sb(env, 'players?id=eq.' + ses.pid, { method: 'PATCH', headers: { Prefer: 'return=minimal' }, body: JSON.stringify({ skills: s }) });
+        if (!r.ok) { console.log('skills_db', r.status); return J({ e: 'err' }, 502, cors); }
+        return J({ ok: 1, cur: b.sel }, 200, cors);
+      }
       if (P === '/guns' || P === '/gun/equip') { /* GUNS vault: pick one of the free weapons; it is used from the NEXT match */
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
         if (!ses.pid) return J({ e: 'guest' }, 403, cors);
@@ -679,11 +658,11 @@ export default {
         if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'mode' && k !== 'code' && !(k === 'cap' && env.LOADTEST === '1'))) return J({ e: 'bad' }, 400, cors); /* cap = players per match, accepted ONLY while the temporary LOADTEST variable is set */
         if (P === '/join') {
           if (!K.TEAM[b.mode] || typeof b.mode !== 'string') return J({ e: 'bad' }, 400, cors);
-          let cs = '', nm = '', pm = 0, wp = 'ar01';
-          if (ses.pid) { const q = (cols) => sb(env, 'players?id=eq.' + ses.pid + '&select=' + cols + 'player_cosmetics(cosmetic_id),pass_progress(premium)&player_cosmetics.equipped=eq.true&pass_progress.month=eq.' + passMonth()); let r = await q('name,banned,weapon,'); if (!r.ok) r = await q('name,banned,'); /* the weapon column may not exist yet: join without it instead of failing */ const row = r.ok ? (await r.json())[0] : null; if (!row) return J({ e: 'err' }, 503, cors); if (row.banned) return J({ e: 'banned' }, 403, cors); cs = pickCos(row.player_cosmetics); nm = String(row.name || '').replace(/[^\p{L}\p{N} _-]/gu, '').trim().slice(0, 24); pm = Array.isArray(row.pass_progress) && row.pass_progress.some((x) => x && x.premium === true) ? 1 : 0; if (typeof row.weapon === 'string' && WPN_IDX[row.weapon] !== undefined) wp = row.weapon; } // fail closed
+          let cs = '', nm = '', pm = 0, wp = 'ar01', sk = ',,,';
+          if (ses.pid) { const q = (cols) => sb(env, 'players?id=eq.' + ses.pid + '&select=' + cols + 'player_cosmetics(cosmetic_id),pass_progress(premium)&player_cosmetics.equipped=eq.true&pass_progress.month=eq.' + passMonth()); let r = await q('name,banned,weapon,skills,'); if (!r.ok) r = await q('name,banned,weapon,'); if (!r.ok) r = await q('name,banned,'); /* the weapon column may not exist yet: join without it instead of failing */ const row = r.ok ? (await r.json())[0] : null; if (!row) return J({ e: 'err' }, 503, cors); if (row.banned) return J({ e: 'banned' }, 403, cors); cs = pickCos(row.player_cosmetics); nm = String(row.name || '').replace(/[^\p{L}\p{N} _-]/gu, '').trim().slice(0, 24); pm = Array.isArray(row.pass_progress) && row.pass_progress.some((x) => x && x.premium === true) ? 1 : 0; if (typeof row.weapon === 'string' && WPN_IDX[row.weapon] !== undefined) wp = row.weapon; if (parseSk(row.skills)) sk = row.skills; } // fail closed
           const [st, j] = await mmCall(env, '/join', { u: ses.u, md: b.mode, cap: env.LOADTEST === '1' && Number.isInteger(b.cap) ? b.cap : 0 });
           if (st !== 200) return J({ e: j.e || 'err' }, st, cors);
-          const t = await mkTok(env, 'J1.', { u: ses.u, pid: ses.pid, m: j.m, md: j.md, pt: j.pt, cs, nm, pm, wp, exp: Date.now() + K.JOIN_MS, n: hex(8) });
+          const t = await mkTok(env, 'J1.', { u: ses.u, pid: ses.pid, m: j.m, md: j.md, pt: j.pt, cs, nm, pm, wp, sk, exp: Date.now() + K.JOIN_MS, n: hex(8) });
           return J({ t, md: j.md, m: j.m }, 200, cors);
         }
         const [st, j] = await mmCall(env, P, { u: ses.u, code: b.code });
@@ -800,7 +779,7 @@ export class MatchRoom {
 
   reset() {
     this.state = 'lobby'; this.seed = (Math.random() * 4294967296) >>> 0; this.R = rng(this.seed);
-    this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.born = []; this.nextId = 1; this.nextB = 1000;
+    this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.born = []; this.zones = []; this.covers = []; this.nextC = 1; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
     this.lastPh = 0; this.lastTk = 0; this.lastZp = 0; this.pAw = 0; this.ranked = false; this.full = false; this.outAt = 0; this.th = 1; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
@@ -869,7 +848,7 @@ export class MatchRoom {
 
   mk(bot, gid, ws) {
     const [x, y] = this.spawn();
-    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, burstLeft: 0, burstAt: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', cs: {}, skill: 0.6 + Math.random() * 0.4, aggr: Math.random(), tgt: 0, tgtAt: 0, side: 1, sideAt: 0, idleUntil: 0, ssd: 1, forceRoam: 0, skip: 0, skipUntil: 0, stuckN: 0, want: 0, cur: 0, chkAt: 0, cx: 0, cy: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0, zs: 0, ksc: 0, asc: 0, ps: 0, dmgS: 0, hk: 0, dmgHum: 0, hplace: 0, f: null };
+    const p = { id: this.nextId++, name: this.name(), bot, gid, ws, x, y, mx: 0, my: 0, aim: 0, fire: 0, cd: 0, hp: C.HP, alive: true, kills: 0, dmg: 0, place: 0, dcAt: 0, seq: 0, ack: 0, known: new Map(), strikes: 0, win: 0, cnt: 0, tx: 0, ty: 0, lx: x, ly: y, thinkAt: 0, killer: 0, auto: 0, maim: 0, mfire: 0, noise: 0, noiseAt: 0, dl: [], w: 0, wr: 0, burstLeft: 0, burstAt: 0, sk: ['', '', '', ''], skt: [0, 0, 0, 0], skAct: [0, 0, 0, 0], sks: null, heal: 0, spd: null, scanUntil: 0, radarUntil: 0, lootUntil: 0, silentUntil: 0, xp: 0, lvl: 1, lq: 0, pend: null, b: [0, 0, 0, 0, 0, 0, 0, 0], maxHp: C.HP, shield: 0, maxSh: C.SHIELD_BASE, hitAt: 0, shots: 0, hits: 0, snaps: 0, lastIn: 0, dcOut: 0, ipc: '', cs: {}, skill: 0.6 + Math.random() * 0.4, aggr: Math.random(), tgt: 0, tgtAt: 0, side: 1, sideAt: 0, idleUntil: 0, ssd: 1, forceRoam: 0, skip: 0, skipUntil: 0, stuckN: 0, want: 0, cur: 0, chkAt: 0, cx: 0, cy: 0, pid: null, party: '', team: 0, assists: 0, dieAt: 0, zs: 0, ksc: 0, asc: 0, ps: 0, dmgS: 0, hk: 0, dmgHum: 0, hplace: 0, f: null };
     this.players.set(p.id, p); return p;
   }
 
@@ -889,7 +868,7 @@ export class MatchRoom {
     else if (t === 5) p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.4); else if (t === 6) this.addXp(p, it.v); else { p.w = t - 6; p.wr = it.v; }
     it.gone = true; this.rm.push(it); // idempotent: gone flag blocks double pickup
   }
-  hurt(e, dm, by, now) { if (now < this.startAt + C.GRACE_MS) return; let d = dm; if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (by) { e.dl = e.dl.filter((x) => now - x.t <= 5000); e.dl.push({ by, t: now, d: dm }); const at = this.players.get(by); if (at) { if (!at.dmgTo) at.dmgTo = new Map(); at.dmgTo.set(e.id, (at.dmgTo.get(e.id) || 0) + dm); } } if (e.hp <= 0 && !e.killer) e.killer = by; }
+  hurt(e, dm, by, now) { if (now < this.startAt + C.GRACE_MS) return; let d = dm; if (e.sks && now < e.sks.until && e.sks.hp > 0) { const a = Math.min(e.sks.hp, d); e.sks.hp -= a; d -= a; } if (e.shield > 0) { const a = Math.min(e.shield, d); e.shield -= a; d -= a; } e.hp -= d; e.hitAt = now; if (by) { e.dl = e.dl.filter((x) => now - x.t <= 5000); e.dl.push({ by, t: now, d: dm }); const at = this.players.get(by); if (at) { if (!at.dmgTo) at.dmgTo = new Map(); at.dmgTo.set(e.id, (at.dmgTo.get(e.id) || 0) + dm); } } if (e.hp <= 0 && !e.killer) e.killer = by; }
   addXp(p, n) {
     if (p.bot || n <= 0) return; p.xp += n | 0;
     while (p.lvl < 10 && p.xp >= C.XP_LV[p.lvl]) { p.lvl++; p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.2); p.lq++; }
@@ -915,6 +894,56 @@ export class MatchRoom {
       const nb = this.bullets[this.bullets.length - 1]; nb.sx = nb.x; nb.sy = nb.y; this.born.push(nb); /* remembered until the next snapshot so even a bullet that dies within 100 ms is still shown to the clients */
     }
   }
+  spdMul(p, now) { let m = 1; if (p.spd && now < p.spd.until) m *= p.spd.mul; if (this.zones.length) for (const z of this.zones) if (z.k === 1 && now < z.until && z.team !== p.team && Math.hypot(p.x - z.x, p.y - z.y) < z.r) { m *= SK_C.SLOW; break; } return m; }
+  smokeHides(e, v, now) { /* an enemy standing in a smoke cloud is invisible from outside; from inside you only see 160 units */
+    if (e.team === v.team) return false;
+    for (const z of this.zones) if (z.k === 0 && now < z.until) { const ein = Math.hypot(e.x - z.x, e.y - z.y) < z.r, vin = Math.hypot(v.x - z.x, v.y - z.y) < z.r; if (ein && !vin) return true; if (vin && !ein && Math.hypot(e.x - v.x, e.y - v.y) > 160) return true; }
+    return false;
+  }
+  addCol(b) { for (let cx = cell(b.x); cx <= cell(b.x + b.w); cx++) for (let cy = cell(b.y); cy <= cell(b.y + b.h); cy++) { const k = cx * 100 + cy, a = this.cg.get(k); if (a) a.push(b); else this.cg.set(k, [b]); } }
+  delCol(b) { for (let cx = cell(b.x); cx <= cell(b.x + b.w); cx++) for (let cy = cell(b.y); cy <= cell(b.y + b.h); cy++) { const a = this.cg.get(cx * 100 + cy); if (a) { const i = a.indexOf(b); if (i >= 0) a.splice(i, 1); } } }
+  addCover(p, now) { /* a temporary wall in front of the player; it blocks tanks AND bullets (it joins the collision grid) */
+    const r = p.aim * 0.0174533, c = Math.cos(r), s = Math.sin(r), cx = p.x + c * SK_C.COVER_AHEAD, cy = p.y + s * SK_C.COVER_AHEAD, horiz = Math.abs(s) > Math.abs(c);
+    const ww = horiz ? SK_C.COVER_LONG : SK_C.COVER_THICK, hh = horiz ? SK_C.COVER_THICK : SK_C.COVER_LONG, x = cx - ww / 2, y = cy - hh / 2;
+    if (x < 0 || y < 0 || x + ww > C.WORLD || y + hh > C.WORLD) return false;
+    for (const o of this.players.values()) if (o.alive && circRect({ x, y, w: ww, h: hh }, o.x, o.y, C.R + 4)) return false; /* never trap a tank inside it */
+    const b = { x, y, w: ww, h: hh, walls: [{ x, y, w: ww, h: hh }], tmp: 1, id: this.nextC++, until: now + SK.cv.d * 1000 };
+    this.addCol(b); this.covers.push(b); return true;
+  }
+  useSkill(p, slot, now) { /* server-authoritative: alive, running match, equipped, off cooldown */
+    if (!p.alive || this.state !== 'running' || !Number.isInteger(slot) || slot < 0 || slot > 3) return false;
+    const code = p.sk[slot], S = SK[code]; if (!S || now < p.skt[slot]) return false;
+    const r = p.aim * 0.0174533, c = Math.cos(r), s = Math.sin(r);
+    switch (code) {
+      case 'sh': p.sks = { hp: SK_C.SHIELD_HP, until: now + S.d * 1000 }; break;
+      case 'cv': if (!this.addCover(p, now)) return false; break;
+      case 'rc': p.heal += SK_C.HEAL; break;
+      case 'ds': { const m = Math.hypot(p.mx, p.my), ux = m > 0 ? p.mx / m : c, uy = m > 0 ? p.my / m : s; for (let i = 1; i <= Math.round(SK_C.DASH / 20); i++) { const nx = p.x + ux * 20, ny = p.y + uy * 20; if (nx < C.R || ny < C.R || nx > C.WORLD - C.R || ny > C.WORLD - C.R || this.hit(nx, ny, C.R)) break; p.x = nx; p.y = ny; } break; }
+      case 'sp': p.spd = { mul: SK_C.SPRINT, until: now + S.d * 1000 }; break;
+      case 'vb': p.spd = { mul: SK_C.BOOST, until: now + S.d * 1000 }; break;
+      case 'sc': p.scanUntil = now + S.d * 1000; break;
+      case 'rd': p.radarUntil = now + S.d * 1000; break;
+      case 'ls': p.lootUntil = now + S.d * 1000; break;
+      case 'sm': this.zones.push({ k: 0, x: p.x + c * SK_C.SMOKE_AHEAD, y: p.y + s * SK_C.SMOKE_AHEAD, r: SK_C.SMOKE_R, until: now + S.d * 1000, team: p.team }); break;
+      case 'sf': this.zones.push({ k: 1, x: p.x, y: p.y, r: SK_C.SLOW_R, until: now + S.d * 1000, team: p.team }); break;
+      case 'ss': p.silentUntil = now + S.d * 1000; break;
+      default: return false;
+    }
+    p.skt[slot] = now + S.cd * 1000; p.skAct[slot] = S.d ? now + S.d * 1000 : 0; return true;
+  }
+  skillExtra(h, f, now, x0, x1, y0, y1) { /* [cooldown s per slot (-1 = empty), active s per slot, scanner [[x,y]] | null, radar angle | -1, loot scan [[type,x,y]] | null, zones in view, covers in view] */
+    const cd = h.sk.map((cc, i) => (cc ? Math.max(0, Math.ceil((h.skt[i] - now) / 1000)) : -1)), act = h.sk.map((cc, i) => (cc ? Math.max(0, Math.ceil((h.skAct[i] - now) / 1000)) : 0));
+    let sc = null, rd = -1, ls = null;
+    if (h.alive) {
+      if (now < h.scanUntil) { sc = []; for (const o of this.players.values()) if (o.alive && o.team !== h.team && sc.length < 14 && Math.hypot(o.x - h.x, o.y - h.y) < SK_C.SCAN_R) sc.push([o.x | 0, o.y | 0]); }
+      if (now < h.radarUntil) { let best = SK_C.RADAR_R, tg = null; for (const o of this.players.values()) if (o.alive && o.team !== h.team) { const d = Math.hypot(o.x - h.x, o.y - h.y); if (d < best) { best = d; tg = o; } } if (tg) rd = nrm(Math.atan2(tg.y - h.y, tg.x - h.x) * 57.2958); }
+      if (now < h.lootUntil) { ls = []; for (const it of this.loot.values()) if (!it.gone && (it.t === 2 || it.t === 4 || it.t === 5 || it.t === 6) && ls.length < 16 && Math.hypot(it.x - h.x, it.y - h.y) < SK_C.LOOT_R) ls.push([it.t, it.x | 0, it.y | 0]); }
+    }
+    const zn = [], cv = [];
+    for (const z of this.zones) if (z.x > x0 - z.r && z.x < x1 + z.r && z.y > y0 - z.r && z.y < y1 + z.r) zn.push([z.k, z.x | 0, z.y | 0, z.r, Math.max(0, z.until - now), z.team === h.team ? 1 : 0]);
+    for (const b of this.covers) if (b.x < x1 && b.x + b.w > x0 && b.y < y1 && b.y + b.h > y0) cv.push([b.x | 0, b.y | 0, b.w, b.h, Math.max(0, b.until - now)]);
+    return h.sk.some(Boolean) || zn.length || cv.length ? [cd, act, sc, rd, ls, zn, cv] : null;
+  }
   humans() { let n = 0; for (const p of this.players.values()) if (!p.bot) n++; return n; }
   aliveHumans() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.alive) n++; return n; }
   connected() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.ws) n++; return n; }
@@ -933,18 +962,18 @@ export class MatchRoom {
     for (const [k, v] of this.nonces) if (v < now) this.nonces.delete(k);
     const pair = new WebSocketPair(); const [cl, sv] = Object.values(pair);
     let nm = ''; try { nm = decodeURIComponent(req.headers.get('x-nm') || ''); } catch {} nm = nm.replace(/[^\p{L}\p{N} _-]/gu, '').slice(0, 24);
-    sv.accept(); this.onOpen(sv, gid, pid, pt, ipc, cs, nm, req.headers.get('x-pm') === '1' ? 1 : 0, req.headers.get('x-wp') || 'ar01');
+    sv.accept(); this.onOpen(sv, gid, pid, pt, ipc, cs, nm, req.headers.get('x-pm') === '1' ? 1 : 0, req.headers.get('x-wp') || 'ar01', req.headers.get('x-sk') || ',,,');
     return new Response(null, { status: 101, webSocket: cl });
   }
 
-  onOpen(ws, gid, pid, pt, ipc, cs, nm, pm, wp) {
+  onOpen(ws, gid, pid, pt, ipc, cs, nm, pm, wp, sk) {
     const now = Date.now(); ws._t0 = now; ws._win = 0; ws._cnt = 0;
     let p = this.byGid.get(gid);
     if (p && !p.bot) { if (p.ws && p.ws !== ws) { try { p.ws.close(1000, 'dup'); } catch {} } p.ws = ws; p.dcAt = 0; p.known = new Map(); p.seq = 0; p.ack = 0; p.lastIn = 0; } /* reconnect: the new client knows nothing yet, so full state is resent and the input counter restarts */
-    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; p.ipc = String(ipc).slice(0, 10); p.cs = parseCos(cs); p.name = nm || 'Player'; p.prem = !!pm; p.w = WPN_IDX[wp] !== undefined ? WPN_IDX[wp] : 0; this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
+    else if (this.state === 'lobby' && this.humans() < C.MAX_PLAYERS) { p = this.mk(false, gid, ws); p.pid = pid; p.party = pt; p.ipc = String(ipc).slice(0, 10); p.cs = parseCos(cs); p.name = nm || 'Player'; p.prem = !!pm; p.w = WPN_IDX[wp] !== undefined ? WPN_IDX[wp] : 0; p.sk = parseSk(sk) || ['', '', '', '']; this.byGid.set(gid, p); if (!this.lobbyAt) this.lobbyAt = now; }
     else { this.mm('/busy', { m: this.mid, u: gid }); this.send(ws, [3, 'busy']); try { ws.close(1000, 'busy'); } catch {} return; }
     ws._p = p;
-    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV, this.ob.map((o) => [o.x, o.y, o.r, o.t, o.v]), WPN.map((x) => [x.id, x.dmg, x.cd, x.sp, x.rg, x.n, x.spr, x.bu, x.gp])]);
+    this.send(ws, [0, p.id, this.seed, this.bl.map((b) => [b.x, b.y, b.w, b.h, b.s]), this.rh, this.rv, this.dist, C.XP_LV, this.ob.map((o) => [o.x, o.y, o.r, o.t, o.v]), WPN.map((x) => [x.id, x.dmg, x.cd, x.sp, x.rg, x.n, x.spr, x.bu, x.gp]), p.sk]);
     if (this.rosterMsg) this.send(ws, this.rosterMsg); // reconnect after the match started
     if (p.pend) this.send(ws, [5, p.lvl, p.pend]);
     ws.addEventListener('message', (e) => this.onMsg(p, ws, e.data));
@@ -971,7 +1000,7 @@ export class MatchRoom {
     if (++ws._cnt > C.MAX_MSG_S) { this.strike(p, ws, 'flood'); try { ws.close(1008, 'rate'); } catch {} return; }
     if (typeof d !== 'string' || d.length > 40) return this.strike(p, ws, 'size');
     let a; try { a = JSON.parse(d); } catch { return this.strike(p, ws, 'json'); }
-    if (Array.isArray(a) && a.length === 2) { if (a[0] === 8 && Number.isInteger(a[1])) { this.send(ws, [7, a[1]]); return; } if (a[0] === 10 && a[1] === 0) { if (!p.alive) p.specNext = 1; return; } return this.choose(p, ws, a); }
+    if (Array.isArray(a) && a.length === 2) { if (a[0] === 8 && Number.isInteger(a[1])) { this.send(ws, [7, a[1]]); return; } if (a[0] === 10 && a[1] === 0) { if (!p.alive) p.specNext = 1; return; } if (a[0] === 11) { this.useSkill(p, a[1], now); return; } return this.choose(p, ws, a); }
     if (!Array.isArray(a) || a.length !== 6 || !a.every(Number.isInteger)) return this.strike(p, ws, 'shape');
     const [seq, mx, my, aim, fire, auto] = a;
     if (seq <= p.seq || seq > p.seq + 1000 || Math.abs(mx) > 100 || Math.abs(my) > 100 || aim < 0 || aim > 359 || (fire !== 0 && fire !== 1) || (auto !== 0 && auto !== 1)) return this.strike(p, ws, 'range');
@@ -1041,7 +1070,7 @@ export class MatchRoom {
     let en = null, best = 1e9, it0 = null;
     this.q(this.gP, b.x, b.y, C.BOT_SEE, (e) => {
       if (e === b || e.team === b.team || (e.bot && el < C.BOT_PEACE_S)) return;
-      const d = Math.hypot(e.x - b.x, e.y - b.y); if (d < best) { best = d; en = e; }
+      const d = Math.hypot(e.x - b.x, e.y - b.y); if (e.silentUntil > now && d > C.BOT_SEE * SK_C.SILENT_SEE) return; if (this.zones.length && this.smokeHides(e, b, now)) return; if (d < best) { best = d; en = e; }
     });
     const out = Math.hypot(b.x - z.cx, b.y - z.cy) > z.r - 250 || Math.hypot(b.x - z.tcx, b.y - z.tcy) > z.tr - 250;
     if (now >= b.sideAt) { b.side = Math.random() < 0.5 ? 1 : -1; b.sideAt = now + 1000 + Math.random() * 1500; }
@@ -1117,6 +1146,8 @@ export class MatchRoom {
     if (this.aliveHumans() === 0) { if (!this.outAt) this.outAt = now; else if (now - this.outAt > C.OUT_MS) { this.finish(now, 'out'); return; } } else this.outAt = 0; /* nobody alive to play: stop paying for the room 15 s later */
     if (this.connected() === 0) { if (!this.emptyAt) this.emptyAt = now; else if (now - this.emptyAt > 20000) { this.finish(now, 'empty'); return; } } else this.emptyAt = 0;
     this.gP = this.grid(false); this.rm = [];
+    if (this.covers.length) { const keepC = []; for (const c of this.covers) { if (now >= c.until) this.delCol(c); else keepC.push(c); } this.covers = keepC; }
+    if (this.zones.length) this.zones = this.zones.filter((z) => now < z.until);
     if (now - this.lastNear >= 1000) { this.lastNear = now; this.nearCheck(); }
     for (const p of this.players.values()) {
       if (!p.alive) continue;
@@ -1129,10 +1160,11 @@ export class MatchRoom {
         if (tg) { p.aim = nrm(Math.atan2(tg.y - p.y, tg.x - p.x) * 57.2958 + p.noise); p.fire = bd <= WPN[p.w].rg ? 1 : p.mfire; } else { p.aim = p.maim; p.fire = p.mfire; }
       }
       if (p.b[6] && now - p.hitAt > 5000 && p.hp < p.maxHp) p.hp = Math.min(p.maxHp, p.hp + p.b[6] * dt);
+      if (p.heal > 0) { const hh = Math.min(p.heal, SK_C.HEAL_PER_S * dt); p.hp = Math.min(p.maxHp, p.hp + hh); p.heal -= hh; } /* Recovery skill */
       if (!p.bot) { const pr = C.PICK_R * (1 + 0.2 * p.b[7]); this.q(this.lg, p.x, p.y, pr, (it) => { if (!it.gone && Math.hypot(it.x - p.x, it.y - p.y) <= pr) this.take(p, it); }); } // server-side pickup range check
       let mx = p.mx, my = p.my; const m = Math.hypot(mx, my);
       if (m > 0) {
-        const f = Math.min(m, 100) / m, sp = C.SPEED * (1 + 0.1 * p.b[2]) * (p.bot ? C.BOT_SPEED : 1) * (Math.min(m, 100) / 100);
+        const f = Math.min(m, 100) / m, sp = C.SPEED * (1 + 0.1 * p.b[2]) * (p.bot ? C.BOT_SPEED : 1) * this.spdMul(p, now) * (Math.min(m, 100) / 100);
         const nx = p.x + (mx / m) * sp * dt, ny = p.y + (my / m) * sp * dt;
         if (!this.hit(nx, p.y, C.R)) p.x = nx;
         if (!this.hit(p.x, ny, C.R)) p.y = ny;
@@ -1153,7 +1185,7 @@ export class MatchRoom {
       let dead = false;
       for (let s = 0; s < 4 && !dead; s++) {
         b.x += (b.vx * dt) / 4; b.y += (b.vy * dt) / 4;
-        if (b.x < 0 || b.y < 0 || b.x > C.WORLD || b.y > C.WORLD || this.hit(b.x, b.y, 0)) { dead = true; break; }
+        if (b.x < 0 || b.y < 0 || b.x > C.WORLD || b.y > C.WORLD || this.hit(b.x, b.y, 1)) { dead = true; break; } /* radius 1, not 0: circRect needs distance < radius, so with 0 bullets flew straight through every wall, rock and tree trunk */
         this.q(this.gP, b.x, b.y, 30, (e) => {
           if (dead || e.id === b.o || !e.alive || e.team === b.tm) return; // friendly fire off
           if ((e.x - b.x) ** 2 + (e.y - b.y) ** 2 < (C.R + 4) ** 2) {
@@ -1207,6 +1239,7 @@ export class MatchRoom {
       const a0 = g.get(cx * 100 + cy), l0 = this.lg.get(cx * 100 + cy), a = a0 && l0 ? a0.concat(l0) : (a0 || l0); if (!a) continue;
       for (const e of a) {
         if (e === h || e.x < x0 || e.x > x1 || e.y < y0 || e.y > y1) continue;
+        if (this.zones.length && e.team !== undefined && !e.blt && !e.l && this.smokeHides(e, f, Date.now())) continue; /* hidden entities simply leave the snapshot */
         seen.add(e.id);
         if (e.blt) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0, e.o, Math.max(0, e.rg - Math.hypot(e.x - e.sx, e.y - e.sy)) | 0]); } }
         else if (e.l) { if (!known.has(e.id)) { known.set(e.id, 1); L.push([e.id, e.t, e.x | 0, e.y | 0, e.v | 0]); } }
@@ -1218,7 +1251,7 @@ export class MatchRoom {
       known.set(e.id, 1); B.push([e.id, e.sx | 0, e.sy | 0, e.vx | 0, e.vy | 0, e.o, Math.hypot(e.x - e.sx, e.y - e.sy) | 0]);
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h)]);
+    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h), this.skillExtra(h, f, Date.now(), x0, x1, y0, y1)]);
   }
 
   finish(now, reason) {
