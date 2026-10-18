@@ -22,7 +22,7 @@ const C = {
   PRICE_REQ_PER_M: 0.15, PRICE_GBS_PER_M: 12.5, DO_MEM_GB: 0.128 // TUNE: check current Cloudflare pricing
 };
 
-const K = { SESSION_MS: 4 * 3600 * 1000, TG_MAX_AGE_S: 86400, JOIN_MS: 30000, OPEN_MS: 35000, PARTY_MAX: 4, PARTY_TTL_MS: 1800000, TEAM: { solo: 1, duo: 2, squad: 4 }, RL: { auth: 20, join: 15, party: 40, stats: 30, shop: 30 } }; // TUNE
+const K = { SESSION_MS: 4 * 3600 * 1000, TG_MAX_AGE_S: 86400, JOIN_MS: 30000, OPEN_MS: 35000, PARTY_MAX: 4, PARTY_TTL_MS: 1800000, TEAM: { solo: 1, duo: 2, squad: 4 }, RL: { auth: 20, join: 15, party: 40, stats: 30, shop: 30, pass: 90 } }; // TUNE
 const COS_ID = /^(hull|cannon|track|detail|glow|bullet|trail|blast|smoke|flag)_[a-z0-9]{2,12}$/;
 const GEM_PACKS = [[100, 99], [310, 299], [520, 499], [1060, 999], [2180, 1999], [5600, 4999]]; /* gems, price in USD cents (display + audit; real payments are not built yet) */
 const pickCos = (rows) => { const got = {}; for (const r of Array.isArray(rows) ? rows : []) { const m = r && typeof r.cosmetic_id === 'string' ? COS_ID.exec(r.cosmetic_id) : null; if (m && !got[m[1]]) got[m[1]] = r.cosmetic_id; } return Object.values(got).join(','); }; // one equipped id per type, validated
@@ -32,40 +32,48 @@ const parseCos = (s) => { const o = {}; for (const id of String(s).split(',')) {
 // Every weapon is free and "normal": the budget is roughly 45-60 damage per second, the trade-off is rate / damage / range / pellets. cd is a multiple of 50 ms (one server tick).
 // Reach rule: spawn 30 + range + 28 must stay < 360 (half of the 720 view height), so no range goes above 290. Magazines/reloading are NOT simulated. TUNE every number here.
 // fields: id, c (ar|smg|sn|sg), dmg per bullet, cd ms between triggers, sp bullet speed, rg range, n pellets, spr spread degrees between pellets, bu bullets per burst, gp ms between burst bullets
-const WPN = [
-  { id: 'ar01', c: 'ar', dmg: 12, cd: 250, sp: 1400, rg: 240, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'ak47', c: 'ar', dmg: 17, cd: 350, sp: 1400, rg: 250, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'm4a1', c: 'ar', dmg: 10, cd: 200, sp: 1450, rg: 250, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'scar', c: 'ar', dmg: 14, cd: 300, sp: 1400, rg: 250, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'famas', c: 'ar', dmg: 8, cd: 500, sp: 1450, rg: 240, n: 1, spr: 0, bu: 3, gp: 50 },
-  { id: 'aug', c: 'ar', dmg: 12, cd: 250, sp: 1500, rg: 260, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'groza', c: 'ar', dmg: 14, cd: 250, sp: 1400, rg: 230, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'xm8', c: 'ar', dmg: 10, cd: 250, sp: 1500, rg: 275, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'mp40', c: 'smg', dmg: 5, cd: 100, sp: 1350, rg: 170, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'mp5', c: 'smg', dmg: 7, cd: 150, sp: 1350, rg: 190, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'ump', c: 'smg', dmg: 9, cd: 200, sp: 1350, rg: 210, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'vector', c: 'smg', dmg: 2.6, cd: 50, sp: 1350, rg: 165, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'p90', c: 'smg', dmg: 4.5, cd: 100, sp: 1350, rg: 190, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'mac10', c: 'smg', dmg: 6, cd: 100, sp: 1350, rg: 150, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'awm', c: 'sn', dmg: 70, cd: 1500, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'kar98', c: 'sn', dmg: 50, cd: 1100, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'm24', c: 'sn', dmg: 45, cd: 950, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'svd', c: 'sn', dmg: 30, cd: 650, sp: 2500, rg: 280, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'sks', c: 'sn', dmg: 22, cd: 450, sp: 2300, rg: 270, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'dragunov', c: 'sn', dmg: 34, cd: 750, sp: 2600, rg: 290, n: 1, spr: 0, bu: 1, gp: 0 },
-  { id: 'm1887', c: 'sg', dmg: 7, cd: 1200, sp: 1200, rg: 150, n: 5, spr: 8, bu: 2, gp: 150 },
-  { id: 'm1014', c: 'sg', dmg: 6, cd: 650, sp: 1200, rg: 160, n: 5, spr: 8, bu: 1, gp: 0 },
-  { id: 'spas12', c: 'sg', dmg: 9, cd: 1100, sp: 1200, rg: 160, n: 6, spr: 9, bu: 1, gp: 0 },
-  { id: 's1897', c: 'sg', dmg: 9, cd: 800, sp: 1200, rg: 170, n: 5, spr: 7, bu: 1, gp: 0 },
-  { id: 'dbs', c: 'sg', dmg: 5, cd: 800, sp: 1200, rg: 150, n: 4, spr: 9, bu: 2, gp: 50 }];
+// POINT BUDGET: every weapon has the SAME total of W_T points spread over DAMAGE (D), FIRE RATE (F) and RANGE (R); each point is worth the same power.
+//   damage per trigger = 1.5 x 1.15^D   |   triggers per second = 0.5 x 1.15^F   |   range = 150 x 1.1135^R (R max 6 = 286, below the 290 view limit)
+//   POWER = DPS x (range/150)^1.3 = 0.75 x 1.15^(D+F+R)  => equal total points = equal power. cd is rounded to 50 ms (one tick) and damage is compensated so DPS stays exact.
+//   To rebalance: change the points below (they MUST still add up to W_T), or W_EXP (how much one extra % of range is worth). Pellets, bursts and bullet speed are part of the weapon type, not of the budget.
+const W_G = 1.15, W_H = Math.pow(1.15, 1 / 1.3), W_T = 34, W_EXP = 1.3;
+const WDEF = [ // id, category, [D, F, R], bullet speed, pellets, spread deg, bullets per burst, ms between burst bullets
+  ['ar01','ar',[15,15,4],1400,1,0,1,0],
+  ['ak47','ar',[17,12,5],1400,1,0,1,0],
+  ['m4a1','ar',[13,16,5],1450,1,0,1,0],
+  ['scar','ar',[15,14,5],1400,1,0,1,0],
+  ['famas','ar',[20,10,4],1450,1,0,3,50],
+  ['aug','ar',[14,14,6],1500,1,0,1,0],
+  ['groza','ar',[17,14,3],1400,1,0,1,0],
+  ['xm8','ar',[13,15,6],1500,1,0,1,0],
+  ['mp40','smg',[10,22,2],1350,1,0,1,0],
+  ['mp5','smg',[12,19,3],1350,1,0,1,0],
+  ['ump','smg',[13,16,5],1350,1,0,1,0],
+  ['vector','smg',[5,27,2],1350,1,0,1,0],
+  ['p90','smg',[9,22,3],1350,1,0,1,0],
+  ['mac10','smg',[11,22,1],1350,1,0,1,0],
+  ['awm','sn',[26,2,6],2600,1,0,1,0],
+  ['kar98','sn',[24,4,6],2600,1,0,1,0],
+  ['m24','sn',[23,5,6],2600,1,0,1,0],
+  ['svd','sn',[20,8,6],2500,1,0,1,0],
+  ['sks','sn',[18,10,6],2300,1,0,1,0],
+  ['dragunov','sn',[21,7,6],2600,1,0,1,0],
+  ['m1887','sg',[28,5,1],1200,5,8,2,150],
+  ['m1014','sg',[23,9,2],1200,5,8,1,0],
+  ['spas12','sg',[27,5,2],1200,6,9,1,0],
+  ['s1897','sg',[25,7,2],1200,5,7,1,0],
+  ['dbs','sg',[25,8,1],1200,4,9,2,50]];
+const mkWpn = ([id, c, pts, sp, n, spr, bu, gp]) => { const rate = 0.5 * Math.pow(W_G, pts[1]), craw = 1000 / rate, cd = Math.max(50, Math.round(craw / 50 + 1e-9) * 50), dpt = 1.5 * Math.pow(W_G, pts[0]) * cd / craw; return { id, c, dmg: Math.round(dpt / (n * bu) * 100) / 100, cd, sp, rg: Math.round(150 * Math.pow(W_H, pts[2])), n, spr, bu, gp, pts }; };
+const WPN = WDEF.map(mkWpn);
+const wpPower = (x) => Math.round((x.dmg * x.n * x.bu * 1000 / x.cd) * Math.pow(x.rg / 150, W_EXP));
 const WPN_IDX = Object.fromEntries(WPN.map((x, i) => [x.id, i]));
-const wpnRow = (x) => [x.id, x.c, x.dmg, x.cd, x.sp, x.rg, x.n, x.spr, x.bu, x.gp];
+const wpnRow = (x) => [x.id, x.c, x.dmg, x.cd, x.sp, x.rg, x.n, x.spr, x.bu, x.gp, x.pts, wpPower(x)];
 
 // ---------- SKILLS: up to 4 per player, ONE per category, chosen in the lobby, used in the match with a cooldown ----------
 // c = category, cd = cooldown seconds, d = effect seconds. All numbers are TUNE values; sizes/distances are in the SK_* constants below.
 const SKCAT = [['sh', 'cv', 'rc'], ['ds', 'sp', 'vb'], ['sc', 'rd', 'ls'], ['sm', 'sf', 'ss']]; /* defense, movement, recon, tactical */
-const SK = { sh: { cd: 45, d: 5 }, cv: { cd: 60, d: 10 }, rc: { cd: 50, d: 5 }, ds: { cd: 25, d: 0 }, sp: { cd: 40, d: 6 }, vb: { cd: 40, d: 6 }, sc: { cd: 50, d: 4 }, rd: { cd: 45, d: 6 }, ls: { cd: 30, d: 8 }, sm: { cd: 35, d: 8 }, sf: { cd: 45, d: 5 }, ss: { cd: 45, d: 7 } };
-const SK_C = { SHIELD_HP: 75, HEAL: 50, HEAL_PER_S: 10, DASH: 260, SPRINT: 1.2, BOOST: 1.25, SCAN_R: 900, RADAR_R: 3000, LOOT_R: 1000, SMOKE_R: 140, SMOKE_AHEAD: 100, SLOW_R: 220, SLOW: 0.75, SILENT_SEE: 0.3, COVER_LONG: 110, COVER_THICK: 20, COVER_AHEAD: 70 };
+const SK = { sh: { cd: 45, d: 5 }, cv: { cd: 60, d: 10 }, rc: { cd: 50, d: 5 }, ds: { cd: 25, d: 0 }, sp: { cd: 40, d: 6 }, vb: { cd: 40, d: 6 }, sc: { cd: 50, d: 4 }, rd: { cd: 45, d: 6 }, ls: { cd: 30, d: 8 }, sm: { cd: 35, d: 8 }, sf: { cd: 45, d: 5 }, ss: { cd: 45, d: 10 } };
+const SK_C = { SHIELD_HP: 75, HEAL: 50, HEAL_PER_S: 10, DASH: 260, DASH_T: 0.2, SPRINT: 1.2, BOOST: 1.25, SCAN_R: 900, RADAR_R: 3000, LOOT_R: 1000, SMOKE_R: 140, SMOKE_AHEAD: 0, SLOW_R: 220, SLOW: 0.75, SILENT_SEE: 0.3, COVER_LONG: 110, COVER_THICK: 20, COVER_AHEAD: 70 };
 const parseSk = (s) => { if (typeof s !== 'string' || !/^[a-z]{0,2}(,[a-z]{0,2}){3}$/.test(s)) return null; const a = s.split(','); for (let i = 0; i < 4; i++) if (a[i] && !SKCAT[i].includes(a[i])) return null; return a; };
 const skRow = (code, i) => [code, i, SK[code].cd, SK[code].d];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -405,7 +413,7 @@ async function buyPassStars(env, ses, cors) {
   return J({ ok: 1, url: r.j.result, stars: PASS_STARS }, 200, cors);
 }
 async function passApi(env, ses, req, P, cors) { // /pass (GET), /pass/claim, /pass/buy, /box/open
-  if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+  if (!(await rl(env, 'pass:' + ses.u, K.RL.pass))) return J({ e: 'slow' }, 429, cors); /* its own counter: pass screen + boxes no longer share the 30/min shop counter */
   if (!ses.pid) return J({ e: 'guest' }, 403, cors);
   const call = async (fn, p) => { const r = await sb(env, 'rpc/' + fn, { method: 'POST', body: JSON.stringify({ p }) }); if (!r.ok) { console.log('pass_db', fn, r.status); return J({ e: 'err' }, 502, cors); } const j = await r.json(); if (j && j.ok) return J(j, 200, cors); const e = (j && j.e) || 'err'; return J(e === 'cool' ? { e, wait: Number(j.wait) | 0 } : { e }, e === 'bad' ? 400 : e === 'player' ? 404 : 409, cors); };
   if (P === '/pass' && req.method === 'GET') { const r = await sb(env, 'rpc/get_pass', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) }); if (!r.ok) { console.log('pass_db', r.status); return J({ e: 'err' }, 502, cors); } const j = await r.json(); if (!j || !j.ok) return J({ e: 'err' }, 404, cors); j.price_stars = PASS_STARS; return J(j, 200, cors); }
@@ -418,7 +426,7 @@ async function passApi(env, ses, req, P, cors) { // /pass (GET), /pass/claim, /p
     return call('claim_pass_tier', { pid: ses.pid, tid: ses.tid || 0, tier: b.tier, track: b.track, dbl: !!b.dbl });
   }
   if (P === '/box/open') {
-    if (Object.keys(b).some((k) => k !== 'n') || !Number.isInteger(b.n) || b.n < 1 || b.n > 20) return J({ e: 'bad' }, 400, cors);
+    if (Object.keys(b).some((k) => k !== 'n') || !Number.isInteger(b.n) || b.n < 1 || b.n > 100) return J({ e: 'bad' }, 400, cors);
     return call('open_box', { pid: ses.pid, n: b.n });
   }
   if (P === '/pass/buy') {
@@ -916,14 +924,19 @@ export class MatchRoom {
     if (p.lq > 0) this.offer(p);
   }
   shoot(p, man) { /* one trigger pull (or one burst bullet): n pellets spread around the aim */
-    const W0 = WPN[p.w];
+    const W0 = WPN[p.w]; p.lastShot = Date.now();
     for (let n = 0; n < W0.n; n++) {
       const r = (p.aim + (W0.n > 1 ? (n - (W0.n - 1) / 2) * W0.spr : 0)) * 0.0174533, c = Math.cos(r), s = Math.sin(r);
       this.bullets.push({ id: this.nextB++, blt: 1, o: p.id, tm: p.team, man: man ? 1 : 0, x: p.x + c * 30, y: p.y + s * 30, vx: c * W0.sp, vy: s * W0.sp, sp: W0.sp, dm: W0.dmg, dist: 0, rg: Math.min(C.MAX_RANGE, W0.rg * (1 + 0.12 * p.b[5])) });
       const nb = this.bullets[this.bullets.length - 1]; nb.sx = nb.x; nb.sy = nb.y; this.born.push(nb); /* remembered until the next snapshot so even a bullet that dies within 100 ms is still shown to the clients */
     }
   }
-  spdMul(p, now) { let m = 1; if (p.spd && now < p.spd.until) m *= p.spd.mul; if (this.zones.length) for (const z of this.zones) if (z.k === 1 && now < z.until && z.team !== p.team && Math.hypot(p.x - z.x, p.y - z.y) < z.r) { m *= SK_C.SLOW; break; } return m; }
+  inSlow(p, now) { for (const z of this.zones) if (z.k === 1 && now < z.until && z.team !== p.team && Math.hypot(p.x - z.x, p.y - z.y) < z.r) return true; return false; }
+  spdMul(p, now) { if (this.zones.length && this.inSlow(p, now)) return SK_C.SLOW; /* inside an enemy Slow Field Sprint/Boost are cancelled: only the slow applies */ let m = 1; if (p.spd && now < p.spd.until) m *= p.spd.mul; return m; }
+  faceOf(p, now) { /* the direction the player SEES his tank facing: the aim while aiming/firing, otherwise the way he moves (or last moved) - same rule as the client turret */
+    const m = Math.hypot(p.mx, p.my); if (p.fire || now - (p.aimAt || 0) < 700 || now - (p.lastShot || 0) < 700 || (m === 0 && p.hd === undefined)) return p.aim * 0.0174533;
+    return m > 0 ? Math.atan2(p.my, p.mx) : p.hd;
+  }
   smokeHides(e, v, now) { /* an enemy standing in a smoke cloud is invisible from outside; from inside you only see 160 units */
     if (e.team === v.team) return false;
     for (const z of this.zones) if (z.k === 0 && now < z.until) { const ein = Math.hypot(e.x - z.x, e.y - z.y) < z.r, vin = Math.hypot(v.x - z.x, v.y - z.y) < z.r; if (ein && !vin) return true; if (vin && !ein && Math.hypot(e.x - v.x, e.y - v.y) > 160) return true; }
@@ -931,8 +944,8 @@ export class MatchRoom {
   }
   addCol(b) { for (let cx = cell(b.x); cx <= cell(b.x + b.w); cx++) for (let cy = cell(b.y); cy <= cell(b.y + b.h); cy++) { const k = cx * 100 + cy, a = this.cg.get(k); if (a) a.push(b); else this.cg.set(k, [b]); } }
   delCol(b) { for (let cx = cell(b.x); cx <= cell(b.x + b.w); cx++) for (let cy = cell(b.y); cy <= cell(b.y + b.h); cy++) { const a = this.cg.get(cx * 100 + cy); if (a) { const i = a.indexOf(b); if (i >= 0) a.splice(i, 1); } } }
-  addCover(p, now) { /* a temporary wall in front of the player; it blocks tanks AND bullets (it joins the collision grid) */
-    const r = p.aim * 0.0174533, c = Math.cos(r), s = Math.sin(r), cx = p.x + c * SK_C.COVER_AHEAD, cy = p.y + s * SK_C.COVER_AHEAD, horiz = Math.abs(s) > Math.abs(c);
+  addCover(p, now, c, s) { /* a temporary wall in front of the player; it blocks tanks AND bullets (it joins the collision grid) */
+    const cx = p.x + c * SK_C.COVER_AHEAD, cy = p.y + s * SK_C.COVER_AHEAD, horiz = Math.abs(s) > Math.abs(c);
     const ww = horiz ? SK_C.COVER_LONG : SK_C.COVER_THICK, hh = horiz ? SK_C.COVER_THICK : SK_C.COVER_LONG, x = cx - ww / 2, y = cy - hh / 2;
     if (x < 0 || y < 0 || x + ww > C.WORLD || y + hh > C.WORLD) return false;
     for (const o of this.players.values()) if (o.alive && circRect({ x, y, w: ww, h: hh }, o.x, o.y, C.R + 4)) return false; /* never trap a tank inside it */
@@ -942,12 +955,13 @@ export class MatchRoom {
   useSkill(p, slot, now) { /* server-authoritative: alive, running match, equipped, off cooldown */
     if (!p.alive || this.state !== 'running' || !Number.isInteger(slot) || slot < 0 || slot > 3) return false;
     const code = p.sk[slot], S = SK[code]; if (!S || now < p.skt[slot]) return false;
-    const r = p.aim * 0.0174533, c = Math.cos(r), s = Math.sin(r);
+    const fr = this.faceOf(p, now), c = Math.cos(fr), s = Math.sin(fr);
+    if ((code === 'sp' || code === 'vb' || code === 'ds') && this.inSlow(p, now)) return false; /* movement skills cannot be used inside an enemy Slow Field */
     switch (code) {
       case 'sh': p.sks = { hp: SK_C.SHIELD_HP, until: now + S.d * 1000 }; break;
-      case 'cv': if (!this.addCover(p, now)) return false; break;
+      case 'cv': if (!this.addCover(p, now, c, s)) return false; break;
       case 'rc': p.heal += SK_C.HEAL; break;
-      case 'ds': { const m = Math.hypot(p.mx, p.my), ux = m > 0 ? p.mx / m : c, uy = m > 0 ? p.my / m : s; for (let i = 1; i <= Math.round(SK_C.DASH / 20); i++) { const nx = p.x + ux * 20, ny = p.y + uy * 20; if (nx < C.R || ny < C.R || nx > C.WORLD - C.R || ny > C.WORLD - C.R || this.hit(nx, ny, C.R)) break; p.x = nx; p.y = ny; } break; }
+      case 'ds': { const m = Math.hypot(p.mx, p.my), ux = m > 0 ? p.mx / m : c, uy = m > 0 ? p.my / m : s; p.dsh = { ux, uy, left: SK_C.DASH, sp: SK_C.DASH / SK_C.DASH_T }; break; } /* a fast visible glide (0.2 s), not a teleport */
       case 'sp': p.spd = { mul: SK_C.SPRINT, until: now + S.d * 1000 }; break;
       case 'vb': p.spd = { mul: SK_C.BOOST, until: now + S.d * 1000 }; break;
       case 'sc': p.scanUntil = now + S.d * 1000; break;
@@ -964,8 +978,8 @@ export class MatchRoom {
     const cd = h.sk.map((cc, i) => (cc ? Math.max(0, Math.ceil((h.skt[i] - now) / 1000)) : -1)), act = h.sk.map((cc, i) => (cc ? Math.max(0, Math.ceil((h.skAct[i] - now) / 1000)) : 0));
     let sc = null, rd = -1, ls = null;
     if (h.alive) {
-      if (now < h.scanUntil) { sc = []; for (const o of this.players.values()) if (o.alive && o.team !== h.team && sc.length < 14 && Math.hypot(o.x - h.x, o.y - h.y) < SK_C.SCAN_R) sc.push([o.x | 0, o.y | 0]); }
-      if (now < h.radarUntil) { let best = SK_C.RADAR_R, tg = null; for (const o of this.players.values()) if (o.alive && o.team !== h.team) { const d = Math.hypot(o.x - h.x, o.y - h.y); if (d < best) { best = d; tg = o; } } if (tg) rd = nrm(Math.atan2(tg.y - h.y, tg.x - h.x) * 57.2958); }
+      if (now < h.scanUntil) { sc = []; for (const o of this.players.values()) if (o.alive && o.team !== h.team && !(o.silentUntil > now) && sc.length < 14 && Math.hypot(o.x - h.x, o.y - h.y) < SK_C.SCAN_R) sc.push([o.x | 0, o.y | 0]); }
+      if (now < h.radarUntil) { let best = SK_C.RADAR_R, tg = null; for (const o of this.players.values()) if (o.alive && o.team !== h.team && !(o.silentUntil > now)) { const d = Math.hypot(o.x - h.x, o.y - h.y); if (d < best) { best = d; tg = o; } } if (tg) rd = nrm(Math.atan2(tg.y - h.y, tg.x - h.x) * 57.2958); }
       if (now < h.lootUntil) { ls = []; for (const it of this.loot.values()) if (!it.gone && (it.t === 2 || it.t === 4 || it.t === 5 || it.t === 6) && ls.length < 16 && Math.hypot(it.x - h.x, it.y - h.y) < SK_C.LOOT_R) ls.push([it.t, it.x | 0, it.y | 0]); }
     }
     const zn = [], cv = [];
@@ -1036,6 +1050,7 @@ export class MatchRoom {
     p.seq = seq; p.ack = seq;
     if (p.alive) {
       if (!auto && fire && p.lastIn && now - p.lastIn < 150) { let d = Math.abs(aim - p.maim); if (d > 180) d = 360 - d; if (d > 120) p.snaps++; } // instant large aim swing right before firing (aimbot signal)
+      if (aim !== p.maim) p.aimAt = now;
       p.lastIn = now; p.mx = mx; p.my = my; p.aim = aim; p.fire = fire; p.maim = aim; p.mfire = fire; p.auto = auto;
     }
   }
@@ -1099,7 +1114,7 @@ export class MatchRoom {
     let en = null, best = 1e9, it0 = null;
     this.q(this.gP, b.x, b.y, C.BOT_SEE, (e) => {
       if (e === b || e.team === b.team || (e.bot && el < C.BOT_PEACE_S)) return;
-      const d = Math.hypot(e.x - b.x, e.y - b.y); if (e.silentUntil > now && d > C.BOT_SEE * SK_C.SILENT_SEE) return; if (this.zones.length && this.smokeHides(e, b, now)) return; if (d < best) { best = d; en = e; }
+      const d = Math.hypot(e.x - b.x, e.y - b.y); if (this.zones.length && this.smokeHides(e, b, now)) return; if (d < best) { best = d; en = e; }
     });
     const out = Math.hypot(b.x - z.cx, b.y - z.cy) > z.r - 250 || Math.hypot(b.x - z.tcx, b.y - z.tcy) > z.tr - 250;
     if (now >= b.sideAt) { b.side = Math.random() < 0.5 ? 1 : -1; b.sideAt = now + 1000 + Math.random() * 1500; }
@@ -1192,7 +1207,10 @@ export class MatchRoom {
       if (p.heal > 0) { const hh = Math.min(p.heal, SK_C.HEAL_PER_S * dt); p.hp = Math.min(p.maxHp, p.hp + hh); p.heal -= hh; } /* Recovery skill */
       if (!p.bot) { const pr = C.PICK_R * (1 + 0.2 * p.b[7]); this.q(this.lg, p.x, p.y, pr, (it) => { if (!it.gone && Math.hypot(it.x - p.x, it.y - p.y) <= pr) this.take(p, it); }); } // server-side pickup range check
       let mx = p.mx, my = p.my; const m = Math.hypot(mx, my);
-      if (m > 0) {
+      if (m > 0) p.hd = Math.atan2(my, mx);
+      if (this.zones.length && (p.spd || p.dsh) && this.inSlow(p, now)) { p.spd = null; p.dsh = null; for (let i = 0; i < 4; i++) if (p.sk[i] === 'sp' || p.sk[i] === 'vb' || p.sk[i] === 'ds') p.skAct[i] = 0; } /* Slow Field cancels active movement skills */
+      if (p.dsh) { let rem = Math.min(p.dsh.left, p.dsh.sp * dt); p.dsh.left -= rem; while (rem > 0.01) { const st = Math.min(20, rem), nx = p.x + p.dsh.ux * st, ny = p.y + p.dsh.uy * st; if (nx < C.R || ny < C.R || nx > C.WORLD - C.R || ny > C.WORLD - C.R || this.hit(nx, ny, C.R)) { p.dsh = null; break; } p.x = nx; p.y = ny; rem -= st; } if (p.dsh && p.dsh.left <= 0.01) p.dsh = null; }
+      if (m > 0 && !p.dsh) {
         const f = Math.min(m, 100) / m, sp = C.SPEED * (1 + 0.1 * p.b[2]) * (p.bot ? C.BOT_SPEED : 1) * this.spdMul(p, now) * (Math.min(m, 100) / 100);
         const nx = p.x + (mx / m) * sp * dt, ny = p.y + (my / m) * sp * dt;
         if (!this.hit(nx, p.y, C.R)) p.x = nx;
