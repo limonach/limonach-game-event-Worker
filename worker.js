@@ -326,35 +326,96 @@ async function tgMaintain(env) { // cron: cancel stale orders, make sure Telegra
   if (r.j && r.j.ok === true) await env.RL.put(key, '1', { expirationTtl: 86400 }); else console.log('tg_setwebhook_fail', r.s, String((r.j && r.j.description) || '').slice(0, 80));
 }
 const esc = (q) => q.replace(/[\\%_]/g, '\\$&');
-const ADMIN_X = new Set(['/admin/overview', '/admin/wdh', '/admin/xr', '/admin/player', '/admin/suspects', '/admin/backup']);
+const ADMIN_X = new Set(['/admin/overview', '/admin/wdl', '/admin/stars', '/admin/xr', '/admin/paytot', '/admin/player', '/admin/pdetail', '/admin/suspects', '/admin/sp', '/admin/sp/top', '/admin/sp/trend', '/admin/sp/set', '/admin/audit', '/admin/backup']);
 const NAME_OK = /^[\p{L}\p{N} _-]{1,24}$/u;
+const PAGE = 25; // rows per page on every dashboard list (the query asks for PAGE + 1 to know whether a next page exists)
+const pgOf = (url) => { const n = Number(url.searchParams.get('pg') || 0); return Number.isInteger(n) && n >= 0 && n <= 100000 ? n : 0; };
+const SORTS = new Map([['xp', 'total_xp.desc'], ['new', 'created_at.desc'], ['coins', 'soft_currency.desc'], ['gems', 'premium_currency.desc']]);
+const admRpc = async (env, fn, p) => { const r = await sb(env, 'rpc/' + fn, { method: 'POST', body: JSON.stringify({ p }) }); if (!r.ok) { console.log('adm_rpc', fn, r.status); return null; } return r.json(); };
+const audit = (env, a, d) => admRpc(env, 'admin_log', { a, d }).catch(() => null); /* every owner action leaves a row in admin_audit */
+const SP_FIELDS = { value: ['sid', 'value', 'dry'], pool: ['sid', 'pool', 'exclude_banned', 'dry'], dates: ['sid', 'ends_at', 'claim_days', 'dry'], endnow: ['sid'] };
 async function admExtra(req, env, url, P) { // dashboard endpoints (already authenticated + rate-limited by admPay)
   if (!ADMIN_X.has(P)) return null;
   const get = async (path) => { const r = await sb(env, path); return r.ok ? r.json() : null; };
+  const sid = () => { const n = Number(url.searchParams.get('sid')); return Number.isInteger(n) && n >= 1 && n <= 100000 ? n : null; };
+  const off = pgOf(url) * PAGE;
   if (P === '/admin/overview') {
-    const r = await sb(env, 'rpc/admin_overview', { method: 'POST', body: JSON.stringify({ p: {} }) });
-    if (!r.ok) { console.log('adm_overview', r.status); return J({ e: 'db' }, 502); }
-    return J({ o: await r.json(), li: (await get('season_liability?select=season,name,value,players,sp_total,sp_open,max_open_usd&order=season.desc&limit=3')) || [] });
+    const j = await admRpc(env, 'admin_overview', {}); if (!j) return J({ e: 'db' }, 502);
+    return J({ o: j, li: (await get('season_liability?select=season,name,value,players,sp_total,sp_open,max_open_usd&order=season.desc&limit=3')) || [] });
   }
-  if (P === '/admin/wdh') return J({ rows: (await get('withdrawals?status=in.(paid,rejected)&select=id,sp,usd,status,note,paid_at,created_at,players(name)&order=id.desc&limit=30')) || [] });
-  if (P === '/admin/xr') return J({ rows: ((await env.DB.prepare('SELECT ref, gems, usd_cents, status, created_at, paid_at FROM orders ORDER BY created_at DESC LIMIT 20').all()).results) || [] });
-  if (P === '/admin/suspects') return J({ rows: (await get('suspect_summary?select=player_id,name,banned,matches_flagged,score,kinds,last_seen&order=score.desc&limit=30')) || [] });
-  if (P === '/admin/backup') return J(req.method === 'POST' ? await backupTick(env, sb, 'force') : await backupStatus(env));
+  if (P === '/admin/wdl') { /* withdrawal requests, 25 per page; the pending queue puts Season Pass Premium owners first */
+    const st = url.searchParams.get('st'), j = await admRpc(env, 'admin_withdrawals', { st: st === 'done' || st === 'all' ? st : 'pending', lim: PAGE, off });
+    return j ? J(j) : J({ e: 'db' }, 502);
+  }
+  if (P === '/admin/stars') { /* Telegram Stars purchases (paid / delivered / refunded only), newest first; a search also finds pending and cancelled orders */
+    const q = (url.searchParams.get('q') || '').trim().slice(0, 64), cols = 'order_id, tid, username, first_name, pack, gems, stars, charge_id, status, refund_status, refund_reason, created_at, paid_at'; let rs;
+    if (q) rs = await env.DB.prepare('SELECT ' + cols + " FROM star_orders WHERE order_id = ?1 OR charge_id = ?1 OR tid = ?2 OR username LIKE ?3 ESCAPE '\\' ORDER BY created_at DESC LIMIT 26 OFFSET ?4").bind(q, /^[0-9]{1,15}$/.test(q) ? Number(q) : -1, esc(q) + '%', off).all();
+    else rs = await env.DB.prepare('SELECT ' + cols + " FROM star_orders WHERE status IN ('PAID','DELIVERED','REFUNDED') ORDER BY created_at DESC LIMIT 26 OFFSET ?1").bind(off).all();
+    const rows = (rs && rs.results) || []; return J({ rows: rows.slice(0, PAGE), more: rows.length > PAGE });
+  }
+  if (P === '/admin/xr') { /* xRocket (USDT) purchases, paid only, newest first */
+    const rs = await env.DB.prepare("SELECT ref, pid, tid, gems, usd_cents, status, created_at, paid_at FROM orders WHERE status = 'paid' ORDER BY created_at DESC LIMIT 26 OFFSET ?1").bind(off).all();
+    const all = (rs && rs.results) || [], rows = all.slice(0, PAGE), ids = [...new Set(rows.map((x) => x.pid).filter((x) => typeof x === 'string' && UUID.test(x)))], nm = {};
+    if (ids.length) { const pl = await get('players?id=in.(' + ids.join(',') + ')&select=id,name'); if (pl) for (const x of pl) nm[x.id] = x.name; }
+    return J({ rows: rows.map((x) => ({ ...x, name: nm[x.pid] || null })), more: all.length > PAGE });
+  }
+  if (P === '/admin/paytot') {
+    const db = env.DB, t = await db.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(status IN ('PAID','DELIVERED')),0) AS ok, COALESCE(SUM(status = 'PENDING'),0) AS pending, COALESCE(SUM(status = 'CANCELLED'),0) AS cancelled, COALESCE(SUM(status = 'REFUNDED'),0) AS refunded, COALESCE(SUM(CASE WHEN charge_id IS NOT NULL THEN stars ELSE 0 END),0) AS stars_in, COALESCE(SUM(CASE WHEN status = 'REFUNDED' THEN refund_stars ELSE 0 END),0) AS stars_refunded, COALESCE(SUM(CASE WHEN charge_id IS NOT NULL THEN gems ELSE 0 END),0) AS gems_sold, COALESCE(SUM(CASE WHEN pack = 100 AND status IN ('PAID','DELIVERED') THEN 1 ELSE 0 END),0) AS pass_sold FROM star_orders").first();
+    const x = await db.prepare("SELECT COUNT(*) AS paid, COALESCE(SUM(usd_cents),0) AS cents, COALESCE(SUM(gems),0) AS gems FROM orders WHERE status = 'paid'").first();
+    return J({ stars: t, xrocket: x });
+  }
+  if (P === '/admin/suspects') { const j = await admRpc(env, 'admin_suspects', { lim: PAGE, off }); return j ? J(j) : J({ e: 'db' }, 502); }
+  if (P === '/admin/audit') { const r = await get('admin_audit?select=id,action,detail,created_at&order=id.desc&limit=' + (PAGE + 1) + '&offset=' + off); if (!r) return J({ e: 'db', hint: 'run stage23.sql' }, 502); return J({ rows: r.slice(0, PAGE), more: r.length > PAGE }); }
+  if (P === '/admin/backup') { if (req.method === 'POST') { const s = await backupTick(env, sb, 'force'); await audit(env, 'backup_force', { day: s && s.day }); return J(s); } return J(await backupStatus(env)); }
+  if (P === '/admin/sp') { const j = await admRpc(env, 'admin_sp_seasons', {}); return j ? J({ seasons: j, now: Date.now() }) : J({ e: 'db', hint: 'run stage23.sql' }, 502); }
+  if (P === '/admin/sp/top') { const s = sid(); if (!s) return J({ e: 'bad' }, 400); const j = await admRpc(env, 'admin_sp_top', { sid: s, lim: PAGE, off }); return j ? J(j) : J({ e: 'db' }, 502); }
+  if (P === '/admin/sp/trend') { const s = sid(); if (!s) return J({ e: 'bad' }, 400); const j = await admRpc(env, 'admin_sp_trend', { sid: s }); return j ? J(j) : J({ e: 'db' }, 502); }
+  if (P === '/admin/sp/set') { /* the ONLY way the dashboard changes a Season Points price or date; strict body, then the SQL function validates again and writes admin_audit */
+    if (req.method !== 'POST') return J({ e: 'bad' }, 405);
+    let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
+    const A = b && typeof b === 'object' && typeof b.action === 'string' && Object.prototype.hasOwnProperty.call(SP_FIELDS, b.action) ? SP_FIELDS[b.action] : null;
+    if (!A || Object.keys(b).some((k) => k !== 'action' && !A.includes(k))) return J({ e: 'bad' }, 400);
+    if (!Number.isInteger(b.sid) || b.sid < 1 || b.sid > 100000 || (b.dry !== undefined && typeof b.dry !== 'boolean') || (b.exclude_banned !== undefined && typeof b.exclude_banned !== 'boolean')) return J({ e: 'bad' }, 400);
+    let fn, p = { sid: b.sid };
+    if (b.dry !== undefined) p.dry = b.dry;
+    if (b.action === 'value') { if (typeof b.value !== 'number' || !Number.isFinite(b.value) || b.value <= 0 || b.value > 0.1) return J({ e: 'range' }, 400); fn = 'admin_sp_set_value'; p.value = b.value; }
+    else if (b.action === 'pool') { if (typeof b.pool !== 'number' || !Number.isFinite(b.pool) || b.pool <= 0 || b.pool > 1000000) return J({ e: 'range' }, 400); fn = 'admin_sp_set_pool'; p.pool = b.pool; if (b.exclude_banned !== undefined) p.exclude_banned = b.exclude_banned; }
+    else if (b.action === 'endnow') { fn = 'admin_sp_set_dates'; p.ends_at = new Date().toISOString(); p.end_now = true; }
+    else {
+      fn = 'admin_sp_set_dates';
+      if (b.ends_at !== undefined) { if (typeof b.ends_at !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/.test(b.ends_at) || !Number.isFinite(Date.parse(b.ends_at))) return J({ e: 'date' }, 400); const y = new Date(b.ends_at).getUTCFullYear(); if (y < 2020 || y > 2100) return J({ e: 'date' }, 400); p.ends_at = new Date(b.ends_at).toISOString(); }
+      if (b.claim_days !== undefined) { if (!Number.isInteger(b.claim_days) || b.claim_days < 1 || b.claim_days > 365) return J({ e: 'claim_days' }, 400); p.claim_days = b.claim_days; }
+      if (p.ends_at === undefined && p.claim_days === undefined) return J({ e: 'nothing' }, 400);
+    }
+    const j = await admRpc(env, fn, p); if (!j) return J({ e: 'db', hint: 'run stage23.sql' }, 502);
+    if (j.ok && !p.dry) console.log('admin_sp', b.action, b.sid);
+    return J(j, j.ok ? 200 : 409);
+  }
+  if (P === '/admin/pdetail') {
+    const id = url.searchParams.get('id') || ''; if (!UUID.test(id)) return J({ e: 'bad' }, 400);
+    const j = await admRpc(env, 'admin_player_detail', { pid: id }); if (!j) return J({ e: 'db' }, 502); if (!j.ok) return J(j, 404);
+    const db = env.DB, so = (await db.prepare('SELECT order_id, pack, gems, stars, status, refund_status, charge_id, created_at FROM star_orders WHERE pid = ?1 ORDER BY created_at DESC LIMIT 10').bind(id).all()).results || [];
+    const xo = (await db.prepare('SELECT ref, gems, usd_cents, status, created_at FROM orders WHERE pid = ?1 ORDER BY created_at DESC LIMIT 10').bind(id).all()).results || [];
+    const bk = await backupStatus(env).catch(() => ({}));
+    return J({ ...j, stars_orders: so, xr_orders: xo, backup_day: bk && bk.day ? bk.day : null });
+  }
   if (P === '/admin/player') {
     if (req.method === 'POST') {
       let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
       if (!b || typeof b.id !== 'string' || !UUID.test(b.id) || typeof b.banned !== 'boolean' || Object.keys(b).length !== 2) return J({ e: 'bad' }, 400);
       const r = await sb(env, 'players?id=eq.' + b.id, { method: 'PATCH', headers: { Prefer: 'return=minimal' }, body: JSON.stringify({ banned: b.banned }) });
-      console.log('admin_ban', b.id, b.banned, r.status); return r.ok ? J({ ok: 1 }) : J({ e: 'db' }, 502);
+      console.log('admin_ban', b.id, b.banned, r.status); if (!r.ok) return J({ e: 'db' }, 502);
+      await audit(env, b.banned ? 'ban' : 'unban', { player_id: b.id }); return J({ ok: 1 });
     }
-    const q = (url.searchParams.get('q') || '').trim().slice(0, 40); let f = '';
-    if (/^[0-9]{1,15}$/.test(q)) f = '&telegram_id=eq.' + q; else if (UUID.test(q)) f = '&id=eq.' + q; else if (NAME_OK.test(q)) f = '&name=ilike.' + encodeURIComponent('*' + q + '*'); else if (q) return J({ rows: [] });
-    return J({ rows: (await get('players?select=id,telegram_id,name,level,total_xp,soft_currency,premium_currency,banned,created_at' + f + '&order=total_xp.desc&limit=20')) || [] });
+    const q = (url.searchParams.get('q') || '').trim().slice(0, 40), srt = SORTS.get(url.searchParams.get('sort')) || SORTS.get('xp'); let f = '';
+    if (/^[0-9]{1,15}$/.test(q)) f = '&telegram_id=eq.' + q; else if (UUID.test(q)) f = '&id=eq.' + q; else if (NAME_OK.test(q)) f = '&name=ilike.' + encodeURIComponent('*' + q + '*'); else if (q) return J({ rows: [], more: false });
+    const r = (await get('players?select=id,telegram_id,name,level,total_xp,soft_currency,premium_currency,banned,created_at' + f + '&order=' + srt + ',id.asc&limit=' + (PAGE + 1) + '&offset=' + off)) || [];
+    return J({ rows: r.slice(0, PAGE), more: r.length > PAGE });
   }
   return null;
 }
 async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-admin header = ADMIN_KEY)
-  if (!(await rl(env, 'adm:' + ip, 40))) return J({ e: 'slow' }, 429);
+  if (!(await rl(env, 'adm:' + ip, 60))) return J({ e: 'slow' }, 429);
   if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
   if (!env.DB) return J({ e: 'nodb' }, 503);
   { const ex = await admExtra(req, env, url, P); if (ex) return ex; }
@@ -364,7 +425,7 @@ async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-ad
       if (!b || !Number.isInteger(b.id) || (b.action !== 'paid' && b.action !== 'reject')) return J({ e: 'bad' }, 400);
       const note = String(b.note || '').slice(0, 100); console.log('admin_wd', b.id, b.action);
       const r = await sb(env, 'rpc/' + (b.action === 'paid' ? 'finish_withdrawal' : 'refund_withdrawal'), { method: 'POST', body: JSON.stringify({ p: { wid: b.id, note: (b.action === 'paid' ? 'manual:' : 'rejected:') + note } }) });
-      return r.ok ? J(await r.json()) : J({ e: 'db' }, 502);
+      if (!r.ok) return J({ e: 'db' }, 502); const wj = await r.json(); if (wj && wj.ok) await audit(env, b.action === 'paid' ? 'wd_paid' : 'wd_reject', { wid: b.id, note }); return J(wj);
     }
     const r = await sb(env, 'withdrawals?status=eq.pending&select=id,player_id,sp,usd,addr,created_at,players(name,telegram_id)&order=id.asc&limit=50'); if (!r.ok) return J({ e: 'db' }, 502);
     const rows = await r.json(), ids = [...new Set(rows.map((x) => x.player_id))], sc = {};
@@ -374,7 +435,7 @@ async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-ad
   if (P === '/admin/refund') {
     let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
     if (req.method !== 'POST' || !b || typeof b.order_id !== 'string') return J({ e: 'bad' }, 400);
-    console.log('admin_refund', b.order_id); return J(await refundOrder(env, b.order_id, b.reason));
+    console.log('admin_refund', b.order_id); const rf = await refundOrder(env, b.order_id, b.reason); if (rf && rf.ok) await audit(env, 'stars_refund', { order_id: b.order_id, reason: String(b.reason || '').slice(0, 80) }); return J(rf);
   }
   const q = (url.searchParams.get('q') || '').trim().slice(0, 64), db = env.DB;
   const t = await db.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(status IN ('PAID','DELIVERED')),0) AS ok, COALESCE(SUM(status = 'PENDING'),0) AS pending, COALESCE(SUM(status = 'CANCELLED'),0) AS cancelled, COALESCE(SUM(status = 'REFUNDED'),0) AS refunded, COALESCE(SUM(CASE WHEN charge_id IS NOT NULL THEN stars ELSE 0 END),0) AS stars_in, COALESCE(SUM(CASE WHEN status = 'REFUNDED' THEN refund_stars ELSE 0 END),0) AS stars_refunded, COALESCE(SUM(CASE WHEN charge_id IS NOT NULL THEN gems ELSE 0 END),0) AS gems_sold, COALESCE(SUM(CASE WHEN status = 'REFUNDED' THEN gems_removed ELSE 0 END),0) AS gems_refunded FROM star_orders").first();
