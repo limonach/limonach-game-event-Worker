@@ -135,7 +135,36 @@ const pg=a.pg||0,tp=await call('/admin/sp/top?sid='+sid+'&pg='+pg);b.append(sec(
 async function vBackup(b){const s=await call('/admin/backup');b.append(h('div',{class:'grid'},card('Bucket bound',s.bucket?'yes':'NO',s.bucket?'ok':'bad'),card('Day',s.day||'-'),card('Status',s.none?'never ran':s.fin?'FINISHED':'in progress',s.fin?'ok':'warn'),card('Players saved',fm(s.n)),card('Errors',fm(s.err),s.err?'bad':'ok'),card('Finished',dt(s.doneAt))));
 if(s.last)b.append(h('p',{class:'bad'},'Last error: '+s.last));if(s.plain)b.append(h('p',{class:'bad'},'Nested player query failed: only the players row is saved. Check Logs for backup embed_fail.'));
 b.append(sec('Shared tables'),tbl(['Table','Rows','Note'],(s.tr||[]).map(t=>[t.name,String(t.rows),t.rows<0?'FAILED':t.truncated?'truncated at 1000':''])));
-b.append(row(btn('RUN / RESTART TODAY BACKUP NOW',async()=>{if(!confirm('Restart today backup now? It continues automatically every 10 minutes.'))return;const r=await post('/admin/backup',{});msg(r.e?'Failed: '+r.e:'Started',!!r.e);here()},'on')),h('p',{class:'mut'},'Automatic: starts at the first 10-minute run after 00:00 UTC and continues until every player has a file. Bucket: save-supabase-limonachgame. Set a lifecycle rule in the R2 dashboard to delete files after 30 days.'))}
+b.append(row(btn('RUN / RESTART TODAY BACKUP NOW',async()=>{if(!confirm('Restart today backup now? It continues automatically every 10 minutes.'))return;const r=await post('/admin/backup',{});msg(r.e?'Failed: '+r.e:'Started',!!r.e);here()},'on')),h('p',{class:'mut'},'Automatic: starts at the first 10-minute run after 00:00 UTC and continues until every player has a file. Bucket: save-supabase-limonachgame. Set a lifecycle rule in the R2 dashboard to delete files after 30 days.'));await restoreUi(b)}
+const rpost=b=>post('/admin/restore',b),pre=t=>h('code',{style:'white-space:pre-wrap'},t),safe=f=>async()=>{try{await f()}catch(e){msg(e.message,1)}};
+const sel=o=>h('select',{},o.map(x=>h('option',{value:x[0]},x[1])));
+async function restoreUi(b){
+b.append(sec('Restore from backup'));
+const d=await rpost({action:'days'});
+if(d.e){b.append(h('p',{class:'bad'},'Restore unavailable ('+d.e+'). Deploy restore.js + worker.js and run stage25.sql in Supabase.'));return}
+const out=h('div',{}),res=o=>{out.replaceChildren(pre(JSON.stringify(o,null,1)));msg(o&&o.e?'Refused: '+o.e:'Done',!!(o&&o.e))};
+b.append(h('p',{class:'sub'},'Newest first, last 10 days. Only a day with manifest.json is complete. Days in the bucket: '+d.total+'. Match history (matches, match_players) is NOT in the backup.'),
+tbl(['Day','Complete','Players','Errors','Player data','Truncated'],d.days.map(x=>[x.day,x.complete?tag('yes','ok'):tag('NO','bad'),fm(x.users),x.errors==null?'-':String(x.errors),x.player_data||'-',(x.truncated||[]).join(', ')||'-'])));
+if(!d.days.length){b.append(h('p',{class:'warn'},'No backup day found in R2.'));return}
+const ds=sel(d.days.map(x=>[x.day,x.day+(x.complete?'':' (incomplete)')]));
+b.append(row(h('span',{class:'mut'},'Backup day'),ds));
+const pin=h('input',{placeholder:'Player UUID'}),pm=sel([['overwrite','overwrite: roll this player back to the backup'],['missing','missing only: add absent rows, change nothing']]);
+const pb=dry=>({action:'player',day:ds.value,pid:pin.value.trim(),mode:pm.value,dry:dry});
+b.append(sec('1) One player'),h('p',{class:'sub'},'PREVIEW shows backup vs live balances and the purchases paid after the backup. Overwrite rolls coins, gems, XP and rows back to the backup; rows created later are kept; a ban is never lifted. Afterwards run RECONCILE for that player.'),
+row(pin),row(pm),row(btn('PREVIEW',safe(async()=>res(await rpost(pb(true)))),'on'),btn('RESTORE PLAYER',safe(async()=>{const r0=await rpost(pb(true));res(r0);if(r0.e)return;const c=prompt('Restore this player from '+ds.value+' ('+pm.value+')? Type RESTORE');if(c===null||c.trim()!=='RESTORE'){msg('Cancelled',1);return}const r=await rpost(Object.assign(pb(false),{confirm:'RESTORE'}));res(r)}),'bad')));
+const fmode=sel([['missing','missing only: safe, adds absent rows, never changes existing ones'],['overwrite','overwrite: ONLY for an empty or scratch database']]);let stop=false;
+const runFull=async()=>{stop=false;for(let i=0;i<100000&&!stop;i++){let r;try{r=await rpost({action:'full_step'})}catch(e){if(String(e.message).indexOf('Too many')>=0){msg('Rate limit, waiting 20 s',1);await new Promise(z=>setTimeout(z,20000));continue}throw e}
+if(r.e==='busy'){await new Promise(z=>setTimeout(z,5000));continue}
+res(r);const ph=r.st&&r.st.phase;if(r.e||ph==='done'||ph==='stopped')break}
+msg(stop?'Paused':'Loop ended: read the result')};
+b.append(sec('2) Full restore (resumable)'),h('p',{class:'warn'},'Overwrite on a live database rolls EVERY player back to the backup while the game keeps running. Use it only on an empty or scratch Supabase project, or for a disaster. Keep the page open: it runs step by step; if it closes press RESUME.'),
+row(fmode),row(btn('START',safe(async()=>{const c=prompt('Start a FULL restore of '+ds.value+' ('+fmode.value+')? Type RESTORE');if(c===null||c.trim()!=='RESTORE'){msg('Cancelled',1);return}const r=await rpost({action:'full_start',day:ds.value,mode:fmode.value,confirm:'RESTORE'});res(r);if(!r.e)await runFull()}),'bad'),btn('RESUME',safe(runFull),'on'),btn('PAUSE',()=>{stop=true}),btn('STATUS',safe(async()=>res(await rpost({action:'full_status'})))),btn('CANCEL',safe(async()=>{if(!confirm('Forget the restore progress? (rows already written stay)'))return;res(await rpost({action:'full_cancel'}))}))));
+const rd=h('input',{type:'number',min:'1',max:'60',value:'3'}),rp=h('input',{placeholder:'Player UUID (empty = everybody)'});
+const rb=dry=>{const o={action:'recon',dry:dry,days:Number(rd.value)};if(rp.value.trim())o.pid=rp.value.trim();return o};
+b.append(sec('3) Reconcile purchases from D1'),h('p',{class:'sub'},'Every PAID Stars / xRocket order in D1 must have its credit in Supabase. Missing ones are credited again (idempotent by order id). A premium pass paid in an older month is never re-granted. 25 per press: press APPLY again while "left" is above 0.'),
+row(h('span',{class:'mut'},'Days back'),rd),row(rp),row(btn('PREVIEW',safe(async()=>res(await rpost(rb(true)))),'on'),btn('APPLY',safe(async()=>{const r0=await rpost(rb(true));res(r0);if(r0.e||!r0.missing)return;if(!confirm('Credit '+r0.missing+' missing purchase(s)?'))return;res(await rpost(Object.assign(rb(false),{confirm:'RESTORE'})))}),'ok')));
+b.append(sec('4) Consistency check'),h('p',{class:'sub'},'Run after any restore. A REST backup is not one snapshot across players: small differences are expected (sp_spent below withdrawals, claims above unlocked tiers). box_counter_behind_jackpots = true means the global box counter is older than the jackpots already paid.'),
+row(btn('CHECK',safe(async()=>res(await rpost({action:'check'}))),'on')),out)}
 async function vAudit(b,a){const pg=a.pg||0,j=await call('/admin/audit?pg='+pg);if(j.e){b.append(h('p',{class:'bad'},'Audit unavailable ('+j.e+'). Run stage23.sql in Supabase.'));return}
 b.append(sec('Audit log - every action you take here'));if(!j.rows.length)b.append(h('p',{class:'mut'},'No actions yet'));
 for(const x of j.rows)b.append(h('div',{class:'panel'},row(h('b',{},x.action),tag('#'+x.id),h('span',{class:'mut'},dt(x.created_at))),h('code',{},JSON.stringify(x.detail))));b.append(pager(pg,j.more,n=>show('Audit',{pg:n})))}

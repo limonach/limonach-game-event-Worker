@@ -13,7 +13,7 @@ const README = [
   'global/<table>.json       : seasons, season_rewards, cosmetics, box_tiers, box_state, box_wins, box_owed, box_jackpots (Supabase) and d1_orders, d1_star_orders, d1_star_ledger (Cloudflare D1 payment ledger).',
   'manifest.json             : counts and errors of this run. A day without manifest.json is incomplete.', '',
   'NOT included (history/logs, large): matches, match_players, suspicion_logs, royale_log, box_log. Balances and purchases do not depend on them.',
-  'Restore order: players first, then every table that references players, then global tables. Schema comes from the SQL files (schema.sql ... stage21.sql), not from this backup.'
+  'Restore: dashboard Backup tab (restore.js). Order: shared tables first (cosmetics, seasons, season_rewards, box_*: foreign keys), then D1, then players, then the player tables. Schema comes from the SQL files (schema.sql ... stage25.sql), not from this backup.'
 ].join('\n');
 const put = (env, k, s, ct) => env.BACKUP.put(k, s, { httpMetadata: { contentType: ct || 'application/json' } });
 export async function backupStatus(env) { const s = await env.RL.get(KEY, 'json'); return s ? { ...s, bucket: !!env.BACKUP } : { none: 1, bucket: !!env.BACKUP }; }

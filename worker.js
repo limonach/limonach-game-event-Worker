@@ -2,6 +2,7 @@
 // Role: API gateway (/auth /join /party/* /leave /stats /ws), Matchmaker DO (queues + parties), MatchRoom DO (one match per DO), Supabase writes at match end.
 import { ADMIN_HTML } from './admin.js';
 import { backupTick, backupStatus } from './backup.js';
+import { restoreApi } from './restore.js';
 // Commit as worker.js next to wrangler.toml (together with admin.js and backup.js). Secrets: JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN.
 
 const C = {
@@ -326,7 +327,7 @@ async function tgMaintain(env) { // cron: cancel stale orders, make sure Telegra
   if (r.j && r.j.ok === true) await env.RL.put(key, '1', { expirationTtl: 86400 }); else console.log('tg_setwebhook_fail', r.s, String((r.j && r.j.description) || '').slice(0, 80));
 }
 const esc = (q) => q.replace(/[\\%_]/g, '\\$&');
-const ADMIN_X = new Set(['/admin/overview', '/admin/wdl', '/admin/stars', '/admin/xr', '/admin/paytot', '/admin/player', '/admin/pdetail', '/admin/suspects', '/admin/sp', '/admin/sp/top', '/admin/sp/trend', '/admin/sp/set', '/admin/audit', '/admin/backup']);
+const ADMIN_X = new Set(['/admin/overview', '/admin/wdl', '/admin/stars', '/admin/xr', '/admin/paytot', '/admin/player', '/admin/pdetail', '/admin/suspects', '/admin/sp', '/admin/sp/top', '/admin/sp/trend', '/admin/sp/set', '/admin/audit', '/admin/backup', '/admin/restore']);
 const NAME_OK = /^[\p{L}\p{N} _-]{1,24}$/u;
 const PAGE = 25; // rows per page on every dashboard list (the query asks for PAGE + 1 to know whether a next page exists)
 const pgOf = (url) => { const n = Number(url.searchParams.get('pg') || 0); return Number.isInteger(n) && n >= 0 && n <= 100000 ? n : 0; };
@@ -336,6 +337,7 @@ const audit = (env, a, d) => admRpc(env, 'admin_log', { a, d }).catch(() => null
 const SP_FIELDS = { value: ['sid', 'value', 'dry'], pool: ['sid', 'pool', 'exclude_banned', 'dry'], dates: ['sid', 'ends_at', 'claim_days', 'dry'], endnow: ['sid'], minmatches: ['sid', 'min'], reset: ['dry', 'confirm'] };
 async function admExtra(req, env, url, P) { // dashboard endpoints (already authenticated + rate-limited by admPay)
   if (!ADMIN_X.has(P)) return null;
+  if (P === '/admin/restore') return restoreApi(req, env, { sb, audit, admRpc, J }); /* backup restore (restore.js): owner only, every step validated there */
   const get = async (path) => { const r = await sb(env, path); return r.ok ? r.json() : null; };
   const sid = () => { const n = Number(url.searchParams.get('sid')); return Number.isInteger(n) && n >= 1 && n <= 100000 ? n : null; };
   const off = pgOf(url) * PAGE;
@@ -418,7 +420,7 @@ async function admExtra(req, env, url, P) { // dashboard endpoints (already auth
   return null;
 }
 async function admPay(req, env, url, ip, P) { // owner-only dashboard data (x-admin header = ADMIN_KEY)
-  if (!(await rl(env, 'adm:' + ip, 60))) return J({ e: 'slow' }, 429);
+  if (!(await rl(env, (P === '/admin/restore' ? 'admr:' : 'adm:') + ip, P === '/admin/restore' ? 240 : 60))) return J({ e: 'slow' }, 429); /* a full restore is a loop of steps: its own, higher counter */
   if (!env.ADMIN_KEY || !teq(req.headers.get('x-admin'), env.ADMIN_KEY)) return new Response(null, { status: 404 });
   if (!env.DB) return J({ e: 'nodb' }, 503);
   { const ex = await admExtra(req, env, url, P); if (ex) return ex; }
