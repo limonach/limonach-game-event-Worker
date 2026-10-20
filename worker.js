@@ -333,7 +333,7 @@ const pgOf = (url) => { const n = Number(url.searchParams.get('pg') || 0); retur
 const SORTS = new Map([['xp', 'total_xp.desc'], ['new', 'created_at.desc'], ['coins', 'soft_currency.desc'], ['gems', 'premium_currency.desc']]);
 const admRpc = async (env, fn, p) => { const r = await sb(env, 'rpc/' + fn, { method: 'POST', body: JSON.stringify({ p }) }); if (!r.ok) { console.log('adm_rpc', fn, r.status); return null; } return r.json(); };
 const audit = (env, a, d) => admRpc(env, 'admin_log', { a, d }).catch(() => null); /* every owner action leaves a row in admin_audit */
-const SP_FIELDS = { value: ['sid', 'value', 'dry'], pool: ['sid', 'pool', 'exclude_banned', 'dry'], dates: ['sid', 'ends_at', 'claim_days', 'dry'], endnow: ['sid'] };
+const SP_FIELDS = { value: ['sid', 'value', 'dry'], pool: ['sid', 'pool', 'exclude_banned', 'dry'], dates: ['sid', 'ends_at', 'claim_days', 'dry'], endnow: ['sid'], minmatches: ['sid', 'min'], reset: ['dry', 'confirm'] };
 async function admExtra(req, env, url, P) { // dashboard endpoints (already authenticated + rate-limited by admPay)
   if (!ADMIN_X.has(P)) return null;
   const get = async (path) => { const r = await sb(env, path); return r.ok ? r.json() : null; };
@@ -375,12 +375,15 @@ async function admExtra(req, env, url, P) { // dashboard endpoints (already auth
     let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
     const A = b && typeof b === 'object' && typeof b.action === 'string' && Object.prototype.hasOwnProperty.call(SP_FIELDS, b.action) ? SP_FIELDS[b.action] : null;
     if (!A || Object.keys(b).some((k) => k !== 'action' && !A.includes(k))) return J({ e: 'bad' }, 400);
-    if (!Number.isInteger(b.sid) || b.sid < 1 || b.sid > 100000 || (b.dry !== undefined && typeof b.dry !== 'boolean') || (b.exclude_banned !== undefined && typeof b.exclude_banned !== 'boolean')) return J({ e: 'bad' }, 400);
-    let fn, p = { sid: b.sid };
+    const isReset = b.action === 'reset';
+    if ((!isReset && (!Number.isInteger(b.sid) || b.sid < 1 || b.sid > 100000)) || (b.dry !== undefined && typeof b.dry !== 'boolean') || (b.exclude_banned !== undefined && typeof b.exclude_banned !== 'boolean')) return J({ e: 'bad' }, 400);
+    let fn, p = isReset ? {} : { sid: b.sid };
     if (b.dry !== undefined) p.dry = b.dry;
     if (b.action === 'value') { if (typeof b.value !== 'number' || !Number.isFinite(b.value) || b.value <= 0 || b.value > 0.1) return J({ e: 'range' }, 400); fn = 'admin_sp_set_value'; p.value = b.value; }
     else if (b.action === 'pool') { if (typeof b.pool !== 'number' || !Number.isFinite(b.pool) || b.pool <= 0 || b.pool > 1000000) return J({ e: 'range' }, 400); fn = 'admin_sp_set_pool'; p.pool = b.pool; if (b.exclude_banned !== undefined) p.exclude_banned = b.exclude_banned; }
     else if (b.action === 'endnow') { fn = 'admin_sp_set_dates'; p.ends_at = new Date().toISOString(); p.end_now = true; }
+    else if (b.action === 'minmatches') { if (!Number.isInteger(b.min) || b.min < 0 || b.min > 500) return J({ e: 'range' }, 400); fn = 'admin_sp_set_min'; p.min = b.min; }
+    else if (b.action === 'reset') { if (b.dry !== true && b.confirm !== 'RESET') return J({ e: 'confirm' }, 400); fn = 'admin_sp_reset'; } /* destructive: the server insists on the typed word, the SQL function refuses if a withdrawal was already paid */
     else {
       fn = 'admin_sp_set_dates';
       if (b.ends_at !== undefined) { if (typeof b.ends_at !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/.test(b.ends_at) || !Number.isFinite(Date.parse(b.ends_at))) return J({ e: 'date' }, 400); const y = new Date(b.ends_at).getUTCFullYear(); if (y < 2020 || y > 2100) return J({ e: 'date' }, 400); p.ends_at = new Date(b.ends_at).toISOString(); }
