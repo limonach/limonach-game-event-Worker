@@ -5,7 +5,7 @@
 const DAY = /^\d{4}-\d{2}-\d{2}$/, PID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, REF = /^[sg][0-9a-f]{24}$/, COL = /^[a-z_][a-z0-9_]{0,40}$/;
 const KEY = 'rbr:rs:state', TTL = { expirationTtl: 604800 };
 export const GLOBAL = ['cosmetics', 'seasons', 'season_rewards', 'box_tiers', 'box_state', 'box_wins', 'box_owed', 'box_jackpots']; // same list as backup.js
-export const KIDS = ['player_cosmetics', 'pass_progress', 'pass_claims', 'pass_orders', 'player_boxes', 'pass_dbl_last', 'pass_doubles', 'daily_claims', 'ad_gem_claims', 'ranked_progress', 'season_progress', 'season_claims', 'royale_state', 'withdrawals', 'gem_orders']; // nested tables of a player file, FK-safe order
+export const KIDS = ['player_cosmetics', 'pass_progress', 'pass_claims', 'pass_orders', 'player_boxes', 'pass_dbl_last', 'pass_doubles', 'daily_claims', 'ad_gem_claims', 'ranked_progress', 'season_progress', 'season_claims', 'royale_state', 'withdrawals', 'gem_orders', 'welcome_bonus']; // nested tables of a player file, FK-safe order
 export const D1T = ['orders', 'star_orders', 'star_ledger'];
 const UNITS = GLOBAL.map((t) => ({ k: 's', t, f: 'global/' + t + '.json' })).concat(D1T.map((t) => ({ k: 'd', t, f: 'global/d1_' + t + '.json' })));
 const FIELDS = { days: [], check: [], player: ['day', 'pid', 'mode', 'dry', 'confirm'], recon: ['dry', 'days', 'pid', 'confirm'], full_start: ['day', 'mode', 'confirm'], full_step: [], full_status: [], full_cancel: [] };
@@ -105,7 +105,7 @@ async function fullStep(env, d, lim) { // one bounded step; call again until pha
       const files = await Promise.all(objs.map(async (o) => { try { const x = await env.BACKUP.get(o.key); return x ? await x.json() : null; } catch { return null; } }));
       const base = [], kids = {}; let bad = 0;
       for (const f of files) { const s = split(f); if (!s) { bad++; continue; } base.push(s.base); for (const t of KIDS) if (s.kids[t] && s.kids[t].length) (kids[t] = kids[t] || []).push(...s.kids[t]); }
-      if (base.length) { const r = await rows(env, d.sb, 'players', st.mode, base); acc(st, 'players', r); st.fail = r.err > 0 && r.ins === 0 ? (st.fail || 0) + 1 : 0; if (st.fail >= 3) { st.phase = 'stopped'; st.notes.push('stopped: the players table failed 3 steps in a row (is stage25.sql installed?)'); } }
+      if (base.length) { const r = await rows(env, d.sb, 'players', st.mode, base); acc(st, 'players', r); st.fail = r.err > 0 && r.ins === 0 ? (st.fail || 0) + 1 : 0; if (st.fail >= 3) { st.phase = 'stopped'; st.notes.push('stopped: the players table failed 3 steps in a row (are stage25.sql and stage26.sql installed?)'); } }
       if (st.phase === 'users') for (const t of KIDS) if (kids[t]) acc(st, t, await rows(env, d.sb, t, st.mode, kids[t]));
       st.users += base.length; st.bad += bad; if (objs.length) st.last = objs[objs.length - 1].key;
       if (st.phase === 'users' && (!objs.length || (objs.length < n && !l.truncated))) st.phase = 'done';

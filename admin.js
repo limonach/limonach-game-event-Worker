@@ -47,7 +47,21 @@ async function vOverview(b){const j=await call('/admin/overview');if(j.e){b.appe
 b.append(h('div',{class:'grid'},card('Players',fm(o.players)),card('New (24h)',fm(o.new_24h)),card('Active (24h)',fm(o.active_24h)),card('Matches (24h)',fm(o.matches_24h)),card('Banned',fm(o.banned),o.banned?'warn':''),card('Coins in circulation',fm(o.coins)),card('Gems in circulation',fm(o.gems)),card('Premium this month',fm(o.premium_month)),card('Boxes opened',fm(o.boxes_opened)),card('Jackpot gems paid',fm(o.jackpots_gems)),card('Withdrawals pending',fm(o.wd_pending)+' / '+usd(o.wd_pending_usd),o.wd_pending?'warn':''),card('Withdrawals paid',usd(o.wd_paid_usd))));
 b.append(sec('Season Points liability (worst case if every open SP is cashed)'));b.append(tbl(['Season','Value/SP','Players','SP total','SP open','Max open USD'],(j.li||[]).map(x=>[x.name||x.season,x.value==null?'not set':'$'+x.value,fm(x.players),fm(x.sp_total),fm(x.sp_open),usd(x.max_open_usd)])));
 b.append(h('p',{class:'mut'},'Prices and dates are managed in the SP & Seasons tab.'))}
-async function vWd(b,a){const st=a.st||'pending',pg=a.pg||0,j=await call('/admin/wdl?st='+st+'&pg='+pg);
+async function welcomeUi(b,a){const ws=a.ws||'pending',wp=a.wp||0,j=await call('/admin/welcome?st='+ws+'&pg='+wp);
+b.append(sec('Welcome gift (0.01 USDT, TON network)'));
+if(j.e){b.append(h('p',{class:'bad'},'Welcome gifts unavailable ('+j.e+'). Run stage26.sql in Supabase.'));return}
+const c=j.counts||{};
+b.append(h('div',{class:'grid'},card('Pending',fm(c.pending)+' / '+usd(c.usd_pending),c.pending?'warn':''),card('Paid',fm(c.paid)+' / '+usd(c.usd_paid)),card('Rejected',fm(c.rejected)),card('Claimed in 24h',fm(c.last_24h))),
+row(...[['pending','Pending'],['done','Processed'],['all','All']].map(x=>btn(x[1],()=>show('Withdrawals',Object.assign({},a,{ws:x[0],wp:0})),x[0]===ws?'on':''))));
+b.append(h('p',{class:'sub'},'One gift per Telegram account and per wallet. Pay only players who really played: check the matches tag. A 0.01 USDT transfer costs more in TON gas than it is worth, so pay several in one go.'));
+if(!j.rows.length)b.append(h('p',{class:'mut'},'Nothing here'));
+for(const w of j.rows){const pend=w.status==='pending',risk=w.banned||w.score>=10;
+b.append(h('div',{class:'panel'+(risk?' risk':'')},row(lnk(w.name||'-',()=>openPlayer(w.player_id)),tag('tg '+(w.telegram_id||'-')),w.banned?tag('BANNED','bad'):'',pend?tag('pending'):tag(w.status,w.status==='paid'?'ok':'bad'),tag('matches '+fm(w.matches),w.matches?'ok':'warn'),tag('suspect '+(w.score||0),w.score>=10?'bad':'')),
+row(h('span',{class:'big'},usd(w.usd)),h('span',{class:'mut'},dt(w.created_at))),h('code',{},w.addr),w.note?h('div',{class:'sub'},'Note: '+w.note):'',
+row(btn('Copy address',()=>copy(w.addr)),pend?btn('MARK PAID',async()=>{const tx=prompt('Transaction hash of your USDT transfer');if(tx===null)return;if(!tx.trim()){msg('Hash required',1);return}if(!confirm('Confirm: you already sent '+usd(w.usd)+' USDT (TON) to this address?'))return;const r=await post('/admin/welcome',{pid:w.player_id,action:'paid',note:tx.trim()});msg(r.ok?'Marked paid':'Failed: '+JSON.stringify(r),!r.ok);here()},'ok'):'',
+pend?btn('REJECT',async()=>{const why=prompt('Reason');if(why===null)return;if(!confirm('Reject the gift of '+(w.name||w.player_id)+'? It cannot be claimed again.'))return;const r=await post('/admin/welcome',{pid:w.player_id,action:'reject',note:why});msg(r.ok?'Rejected':'Failed: '+JSON.stringify(r),!r.ok);here()},'bad'):'')))}
+b.append(pager(wp,j.more,n=>show('Withdrawals',Object.assign({},a,{wp:n}))))}
+async function vWd(b,a){await welcomeUi(b,a);const st=a.st||'pending',pg=a.pg||0,j=await call('/admin/wdl?st='+st+'&pg='+pg);
 b.append(row(...[['pending','Pending'],['done','Processed'],['all','All']].map(x=>btn(x[1],()=>show('Withdrawals',{st:x[0]}),x[0]===st?'on':''))));
 if(j.e){b.append(h('p',{class:'bad'},'Failed ('+j.e+'). Run stage23.sql in Supabase.'));return}
 b.append(h('p',{class:'mut'},st==='pending'?'Queue: Season Pass Premium owners first, then oldest first. 25 per page.':'Newest first. 25 per page.'));

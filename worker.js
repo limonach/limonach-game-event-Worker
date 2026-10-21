@@ -209,6 +209,7 @@ function tonAddr(s, testnet) { /* friendly TON address (48 chars, EQ.../UQ...): 
   return { key: (wc === 0xff ? '-1' : '0') + ':' + [...u.subarray(2, 34)].map((b) => b.toString(16).padStart(2, '0')).join('') };
 }
 const isTestnet = (env) => String(env.XROCKET_BASE || '').includes('testnet');
+const WELCOME = { USD: 0.01, CAP: 100 }; /* welcome gift: the amount exists ONLY here (the client never sends it); CAP = max gifts per 24 h (env WELCOME_DAILY_CAP overrides); env WELCOME_BONUS = "0" switches the gift off */
 async function autoRotate(env) { try { const r = await sb(env, 'rpc/auto_rotate_season', { method: 'POST', body: '{}' }); if (!r.ok) console.log('rotate_db', r.status); } catch (e) { console.log('rotate_err'); } }
 
 // ---------- Telegram Stars (XTR): digital goods paid inside Telegram ----------
@@ -327,7 +328,7 @@ async function tgMaintain(env) { // cron: cancel stale orders, make sure Telegra
   if (r.j && r.j.ok === true) await env.RL.put(key, '1', { expirationTtl: 86400 }); else console.log('tg_setwebhook_fail', r.s, String((r.j && r.j.description) || '').slice(0, 80));
 }
 const esc = (q) => q.replace(/[\\%_]/g, '\\$&');
-const ADMIN_X = new Set(['/admin/overview', '/admin/wdl', '/admin/stars', '/admin/xr', '/admin/paytot', '/admin/player', '/admin/pdetail', '/admin/suspects', '/admin/sp', '/admin/sp/top', '/admin/sp/trend', '/admin/sp/set', '/admin/audit', '/admin/backup', '/admin/restore']);
+const ADMIN_X = new Set(['/admin/overview', '/admin/wdl', '/admin/stars', '/admin/xr', '/admin/paytot', '/admin/player', '/admin/pdetail', '/admin/suspects', '/admin/sp', '/admin/sp/top', '/admin/sp/trend', '/admin/sp/set', '/admin/audit', '/admin/backup', '/admin/restore', '/admin/welcome']);
 const NAME_OK = /^[\p{L}\p{N} _-]{1,24}$/u;
 const PAGE = 25; // rows per page on every dashboard list (the query asks for PAGE + 1 to know whether a next page exists)
 const pgOf = (url) => { const n = Number(url.searchParams.get('pg') || 0); return Number.isInteger(n) && n >= 0 && n <= 100000 ? n : 0; };
@@ -341,6 +342,18 @@ async function admExtra(req, env, url, P) { // dashboard endpoints (already auth
   const get = async (path) => { const r = await sb(env, path); return r.ok ? r.json() : null; };
   const sid = () => { const n = Number(url.searchParams.get('sid')); return Number.isInteger(n) && n >= 1 && n <= 100000 ? n : null; };
   const off = pgOf(url) * PAGE;
+  if (P === '/admin/welcome') { /* welcome gifts (0.01 USDT, TON): the owner pays by hand, then marks them paid (needs the transfer hash) or rejects */
+    if (req.method === 'POST') {
+      let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400); }
+      if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'pid' && k !== 'action' && k !== 'note') || typeof b.pid !== 'string' || !UUID.test(b.pid) || (b.action !== 'paid' && b.action !== 'reject') || (b.note !== undefined && typeof b.note !== 'string')) return J({ e: 'bad' }, 400);
+      const note = String(b.note || '').slice(0, 100); if (b.action === 'paid' && !note.trim()) return J({ e: 'note' }, 400);
+      const j = await admRpc(env, 'admin_welcome_set', { pid: b.pid, action: b.action, note }); if (!j) return J({ e: 'db' }, 502);
+      if (j.ok) await audit(env, b.action === 'paid' ? 'welcome_paid' : 'welcome_reject', { pid: b.pid, note }); return J(j, j.ok ? 200 : 409);
+    }
+    const st = url.searchParams.get('st'), j = await admRpc(env, 'admin_welcome_list', { st: st === 'done' || st === 'all' ? st : 'pending', lim: PAGE, off });
+    if (!j) return J({ e: 'db', hint: 'run stage26.sql' }, 502); const rs = Array.isArray(j.rows) ? j.rows : [];
+    return J({ rows: rs.slice(0, PAGE), more: rs.length > PAGE, counts: j.counts || {} });
+  }
   if (P === '/admin/overview') {
     const j = await admRpc(env, 'admin_overview', {}); if (!j) return J({ e: 'db' }, 502);
     return J({ o: j, li: (await get('season_liability?select=season,name,value,players,sp_total,sp_open,max_open_usd&order=season.desc&limit=3')) || [] });
@@ -610,6 +623,25 @@ export default {
         if (!r.ok) { console.log('daily_claim_db', r.status); return J({ e: 'err' }, 502, cors); }
         const j = await r.json(); if (j.ok) return J(j, 200, cors);
         return J({ e: j.e || 'err' }, j.e === 'dup' || j.e === 'noad' ? 409 : 404, cors);
+      }
+      if (P === '/welcome' || P === '/welcome/claim') { /* WELCOME GIFT: a REQUEST for 0.01 USDT (TON network), one per account and one per wallet; nothing is paid here: the owner reviews it in /admin/ui (Withdrawals tab) */
+        if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
+        if (!ses.pid) return J({ e: 'guest' }, 403, cors);
+        if (env.WELCOME_BONUS === '0') return P === '/welcome' && req.method === 'GET' ? J({ st: 'off' }, 200, cors) : J({ e: 'off' }, 403, cors);
+        if (P === '/welcome' && req.method === 'GET') {
+          const r = await sb(env, 'rpc/get_welcome', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid } }) });
+          if (!r.ok) { console.log('welcome_db', r.status); return J({ e: 'err' }, 502, cors); }
+          const j = await r.json(); return J({ st: j && typeof j.st === 'string' ? j.st : 'none', usd: WELCOME.USD }, 200, cors);
+        }
+        if (req.method !== 'POST' || P === '/welcome') return new Response(null, { status: 405 });
+        let b; try { b = await req.json(); } catch { return J({ e: 'bad' }, 400, cors); }
+        if (!b || typeof b !== 'object' || Object.keys(b).some((k) => k !== 'addr') || typeof b.addr !== 'string') return J({ e: 'bad' }, 400, cors);
+        const ak = tonAddr(b.addr.trim(), isTestnet(env)); if (!ak) return J({ e: 'addr' }, 400, cors); /* checksum + network checked: a typo never reaches the database */
+        const cap = Number(env.WELCOME_DAILY_CAP) >= 1 ? Math.min(1000, Number(env.WELCOME_DAILY_CAP) | 0) : WELCOME.CAP;
+        const r = await sb(env, 'rpc/claim_welcome', { method: 'POST', body: JSON.stringify({ p: { pid: ses.pid, addr: b.addr.trim(), key: ak.key, usd: WELCOME.USD, cap } }) });
+        if (!r.ok) { console.log('welcome_db', r.status); return J({ e: 'err' }, 502, cors); }
+        const j = await r.json(); if (j && j.ok) { console.log('welcome_claim'); return J({ ok: 1, usd: WELCOME.USD }, 200, cors); }
+        const e = (j && j.e) || 'err'; return J({ e }, e === 'bad' ? 400 : e === 'player' ? 404 : 409, cors);
       }
       if (P === '/ranked' || P === '/sp/gems' || P === '/sp/withdraw') { /* season rank + season points store (no money moves here: withdrawals are only REQUESTS reviewed by the owner) */
         if (!(await rl(env, 'shop:' + ses.u, K.RL.shop))) return J({ e: 'slow' }, 429, cors);
