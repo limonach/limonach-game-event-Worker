@@ -6,7 +6,7 @@ import { restoreApi } from './restore.js';
 // Commit as worker.js next to wrangler.toml (together with admin.js and backup.js). Secrets: JOIN_SECRET, ADMIN_KEY, SUPABASE_SERVICE_ROLE_KEY, TELEGRAM_BOT_TOKEN.
 
 const C = {
-  TICK_HZ: 20, SNAP_EVERY: 2,                 // TUNE: 20Hz sim, 10Hz snapshots
+  TICK_HZ: 30, SNAP_EVERY: 1,                 // TUNE: 30Hz sim, 30Hz delta snapshots (set SNAP_EVERY 2 for 15Hz if the late-tick stats ever rise)
   MAX_PLAYERS: 52, START_HUMANS: 10, LOBBY_MS: 30000, // TUNE: start when 10 humans or 30s with >=1
   WORLD: 8000, CELL: 200, VIEW_HX: 740, VIEW_HY: 460,
   R: 24, HP: 100, SPEED: 220, DMG: 12, COOLDOWN_MS: 250, BSPEED: 1400, RANGE: 240, MAX_RANGE: 300, // TUNE: reach = range+58 must stay < 360 (half of 720 view height)
@@ -79,6 +79,7 @@ const parseSk = (s) => { if (typeof s !== 'string' || !/^[a-z]{0,2}(,[a-z]{0,2})
 const skRow = (code, i) => [code, i, SK[code].cd, SK[code].d];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const enc = new TextEncoder();
+const hr = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()); // NOTE: on Cloudflare the clocks only advance after I/O, so CPU durations measured with hr() read ~0 in production; input delay, snapshot bytes/counts and lag/late ticks are the reliable numbers
 const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const unb64u = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
 const hkey = (secret, use) => crypto.subtle.importKey('raw', typeof secret === 'string' ? enc.encode(secret) : secret, { name: 'HMAC', hash: 'SHA-256' }, false, [use]);
@@ -917,7 +918,7 @@ export class MatchRoom {
     this.players = new Map(); this.byGid = new Map(); this.bullets = []; this.born = []; this.zones = []; this.covers = []; this.nextC = 1; this.nextId = 1; this.nextB = 1000;
     this.tickN = 0; this.lobbyAt = 0; this.startAt = 0; this.endAt = 0; this.emptyAt = 0;
     this.susp = []; this.sockMs = 0; this.msgsMatch = 0; this.lastZone = null; this.lastLobbyMsg = 0;
-    this.lastPh = 0; this.lastTk = 0; this.lastZp = 0; this.pAw = 0; this.ranked = false; this.full = false; this.outAt = 0; this.th = 1; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.genMap(); this.genZone(); this.genLoot();
+    this.lastPh = 0; this.lastTk = 0; this.lastZp = 0; this.pAw = 0; this.ranked = false; this.full = false; this.outAt = 0; this.th = 1; this.tl = []; this.teams = 0; this.lastNear = 0; this.near = new Map(); this.rosterMsg = null; this.lagN = 0; this.lagSum = 0; this.lagMax = 0; this.late = 0; this.bytesOut = 0; this.rm = []; this.gPm = new Map(); this.gAm = new Map(); this.iN = 0; this.iSum = 0; this.iMax = 0; this.simN = 0; this.simSum = 0; this.simMax = 0; this.sbN = 0; this.sbSum = 0; this.sbMax = 0; this.tkN = 0; this.tkSum = 0; this.tkMax = 0; this.snN = 0; this.snB = 0; this.snBMax = 0; this.sdSum = 0; this.sdMax = 0; this.wsN = 0; this.genMap(); this.genZone(); this.genLoot();
   }
 
   genMap() { // seeded: same seed -> same map. Buildings on 50u grid, 4 horizontal + 4 vertical roads, 16 district tints.
@@ -1088,7 +1089,7 @@ export class MatchRoom {
   humans() { let n = 0; for (const p of this.players.values()) if (!p.bot) n++; return n; }
   aliveHumans() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.alive) n++; return n; }
   connected() { let n = 0; for (const p of this.players.values()) if (!p.bot && p.ws) n++; return n; }
-  send(ws, arr) { try { if (ws && ws.readyState === 1) { const m = JSON.stringify(arr); this.bytesOut += m.length; ws.send(m); } } catch {} }
+  send(ws, arr, snp) { try { if (ws && ws.readyState === 1) { const t = hr(), m = JSON.stringify(arr), d = hr() - t; this.bytesOut += m.length; this.wsN++; if (snp) { this.snN++; this.snB += m.length; if (m.length > this.snBMax) this.snBMax = m.length; this.sdSum += d; if (d > this.sdMax) this.sdMax = d; } ws.send(m); } } catch {} }
 
   async fetch(req) {
     const u = new URL(req.url);
@@ -1149,13 +1150,13 @@ export class MatchRoom {
     if (p.alive) {
       if (!auto && fire && p.lastIn && now - p.lastIn < 150) { let d = Math.abs(aim - p.maim); if (d > 180) d = 360 - d; if (d > 120) p.snaps++; } // instant large aim swing right before firing (aimbot signal)
       if (aim !== p.maim) p.aimAt = now;
-      p.lastIn = now; p.mx = mx; p.my = my; p.aim = aim; p.fire = fire; p.maim = aim; p.mfire = fire; p.auto = auto;
+      if (!p.rxAt) p.rxAt = now; /* metrics: time of the oldest input not applied yet */ p.lastIn = now; p.mx = mx; p.my = my; p.aim = aim; p.fire = fire; p.maim = aim; p.mfire = fire; p.auto = auto;
     }
   }
 
   // spatial grid: key = cx*100+cy
-  grid(withBullets) {
-    const g = new Map();
+  grid(withBullets, g) { /* g = a persistent Map owned by the room: cell arrays are emptied and reused instead of allocated every tick */
+    for (const a of g.values()) a.length = 0;
     const add = (e) => { const k = cell(e.x) * 100 + cell(e.y); const a = g.get(k); if (a) a.push(e); else g.set(k, [e]); };
     for (const p of this.players.values()) if (p.alive) add(p);
     if (withBullets) for (const b of this.bullets) add(b);
@@ -1282,17 +1283,18 @@ export class MatchRoom {
       return;
     }
     // running
-    const el = (now - this.startAt) / 1000; const z = this.z = this.zoneAt(el); const zp = this.zoneProg(el), dzp = Math.max(0, zp - this.lastZp); this.lastZp = zp;
+    const tk0 = hr(); const el = (now - this.startAt) / 1000; const z = this.z = this.zoneAt(el); const zp = this.zoneProg(el), dzp = Math.max(0, zp - this.lastZp); this.lastZp = zp;
     const dps = el > C.HARD_CAP_S ? 200 : z.dps;
     if (z.ph !== this.lastPh) { if (this.lastPh) for (const p of this.players.values()) if (p.alive) this.addXp(p, C.PHASE_XP); this.lastPh = z.ph; }
     if (this.aliveHumans() === 0) { if (!this.outAt) this.outAt = now; else if (now - this.outAt > C.OUT_MS) { this.finish(now, 'out'); return; } } else this.outAt = 0; /* nobody alive to play: stop paying for the room 15 s later */
     if (this.connected() === 0) { if (!this.emptyAt) this.emptyAt = now; else if (now - this.emptyAt > 20000) { this.finish(now, 'empty'); return; } } else this.emptyAt = 0;
-    this.gP = this.grid(false); this.rm = [];
+    this.gP = this.grid(false, this.gPm); this.rm = [];
     if (this.covers.length) { const keepC = []; for (const c of this.covers) { if (now >= c.until) this.delCol(c); else keepC.push(c); } this.covers = keepC; }
     if (this.zones.length) this.zones = this.zones.filter((z) => now < z.until);
     if (now - this.lastNear >= 1000) { this.lastNear = now; this.nearCheck(); }
     for (const p of this.players.values()) {
       if (!p.alive) continue;
+      if (p.rxAt) { const d = now - p.rxAt; p.rxAt = 0; this.iN++; this.iSum += d; if (d > this.iMax) this.iMax = d; } /* metrics: input receive -> applied in the simulation */
       if (!p.bot && !p.ws && p.dcAt && C.DC_GRACE_MS && now - p.dcAt > C.DC_GRACE_MS) { p.hp = 0; p.dcOut = 1; this.kill(p, now); continue; }
       if (p.bot && now >= p.thinkAt) { p.thinkAt = now + 200; this.think(p, now); }
       if (!p.bot && p.auto) { // server-side auto-aim/auto-fire: nearest visible enemy in AUTO_RANGE, same rules for everyone
@@ -1315,10 +1317,10 @@ export class MatchRoom {
         if (!this.hit(p.x, ny, C.R)) p.y = ny;
         p.x = Math.max(C.R, Math.min(C.WORLD - C.R, p.x)); p.y = Math.max(C.R, Math.min(C.WORLD - C.R, p.y));
       }
-      if (p.burstLeft > 0 && now >= p.burstAt) { this.shoot(p, false); p.burstLeft--; p.burstAt = now + WPN[p.w].gp; } /* the next bullet of a burst (FAMAS, M1887, DB shotgun) */
+      if (p.burstLeft > 0 && now >= p.burstAt) { this.shoot(p, false); p.burstLeft--; p.burstAt = now - p.burstAt < 1.5 * 1000 / C.TICK_HZ ? p.burstAt + WPN[p.w].gp : now + WPN[p.w].gp; } /* the next bullet of a burst (FAMAS, M1887, DB shotgun) */
       if (p.fire && now >= p.cd) {
         const W0 = WPN[p.w], man = !p.bot && !p.auto && W0.n === 1 && W0.bu === 1; if (man) p.shots++; /* only manual single-bullet shots count for accuracy */
-        p.cd = now + (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]);
+        { const iv = (W0.cd * (p.bot ? C.BOT_CD : 1)) / (1 + 0.15 * p.b[3]); p.cd = now - p.cd < 1.5 * 1000 / C.TICK_HZ ? p.cd + iv : now + iv; } /* keeps the exact average fire rate when cd is not a multiple of the tick (50 ms at 30 Hz); max one shot per tick, no burst after a pause */
         this.shoot(p, man); if (W0.bu > 1) { p.burstLeft = W0.bu - 1; p.burstAt = now + W0.gp; }
       }
       if (Math.hypot(p.x - z.cx, p.y - z.cy) > z.r) { p.hp -= dps * dt; if (p.hp <= 0) p.killer = 0; } else if (!p.bot) p.zs += 5 * dzp; /* match score: zone points grow gradually, only while alive INSIDE the safe zone */
@@ -1347,11 +1349,14 @@ export class MatchRoom {
     { const T = this.teams, thr = [Math.ceil(T * 0.4), Math.ceil(T * 0.2), Math.ceil(T * 0.1)], val = [3, 4, 5]; /* placement points when the number of living teams falls to 40% / 20% / 10% of the start */
       while (this.pAw < 3 && ta.size <= thr[this.pAw]) { const v = val[this.pAw]; for (const p of this.players.values()) if (!p.bot && p.alive) p.ps += v; this.pAw++; } }
     if (ta.size <= 1 || el > C.HARD_CAP_S + 15) { for (const p of this.players.values()) if (ta.has(p.team)) p.place = 1; this.finish(now, ta.size <= 1 ? 'last' : 'cap'); return; }
+    const tk1 = hr(), dS = tk1 - tk0; this.simN++; this.simSum += dS; if (dS > this.simMax) this.simMax = dS;
     if (this.tickN % C.SNAP_EVERY === 0) {
-      const gAll = this.grid(true), zArr = [z.cx | 0, z.cy | 0, z.r | 0, z.tcx | 0, z.tcy | 0, z.tr | 0, Math.ceil(z.left), z.ph, z.dps, z.shrink];
+      const gAll = this.grid(true, this.gAm), zArr = [z.cx | 0, z.cy | 0, z.r | 0, z.tcx | 0, z.tcy | 0, z.tr | 0, Math.ceil(z.left), z.ph, z.dps, z.shrink];
       for (const h of this.players.values()) if (!h.bot && h.ws) this.snap(h, gAll, zArr, alive, el);
       this.born = [];
+      const dB = hr() - tk1; this.sbN++; this.sbSum += dB; if (dB > this.sbMax) this.sbMax = dB;
     }
+    const dT = hr() - tk0; this.tkN++; this.tkSum += dT; if (dT > this.tkMax) this.tkMax = dT;
   }
 
   humanOut(team, now) { /* the last living human of a team died: the human-team placement is fixed now and the ranked result is frozen */
@@ -1378,17 +1383,17 @@ export class MatchRoom {
     h.spec = l[i].id; return l[i];
   }
   snap(h, g, zArr, alive, el) {
-    const known = h.known, seen = new Set(), P = [], B = [], L = [];
+    const known = h.known, seen = new Set(), P = [], B = [], L = [], nowT = Date.now();
     const f = h.alive ? h : (this.specOf(h) || h), x0 = f.x - C.VIEW_HX, x1 = f.x + C.VIEW_HX, y0 = f.y - C.VIEW_HY, y1 = f.y + C.VIEW_HY; // fixed server-side window
     for (let cx = cell(x0); cx <= cell(x1); cx++) for (let cy = cell(y0); cy <= cell(y1); cy++) {
       const a0 = g.get(cx * 100 + cy), l0 = this.lg.get(cx * 100 + cy), a = a0 && l0 ? a0.concat(l0) : (a0 || l0); if (!a) continue;
       for (const e of a) {
         if (e === h || e.x < x0 || e.x > x1 || e.y < y0 || e.y > y1) continue;
-        if (this.zones.length && e.team !== undefined && !e.blt && !e.l && this.smokeHides(e, f, Date.now())) continue; /* hidden entities simply leave the snapshot */
+        if (this.zones.length && e.team !== undefined && !e.blt && !e.l && this.smokeHides(e, f, nowT)) continue; /* hidden entities simply leave the snapshot */
         seen.add(e.id);
         if (e.blt) { if (!known.has(e.id)) { known.set(e.id, 1); B.push([e.id, e.x | 0, e.y | 0, e.vx | 0, e.vy | 0, e.o, Math.max(0, e.rg - Math.hypot(e.x - e.sx, e.y - e.sy)) | 0]); } }
         else if (e.l) { if (!known.has(e.id)) { known.set(e.id, 1); L.push([e.id, e.t, e.x | 0, e.y | 0, e.v | 0]); } }
-        else { const s = (e.x | 0) + ',' + (e.y | 0) + ',' + e.aim + ',' + Math.ceil(e.hp); if (known.get(e.id) !== s) { known.set(e.id, s); P.push([e.id, e.x | 0, e.y | 0, e.aim, Math.ceil(e.hp)]); } }
+        else { const x = e.x | 0, y = e.y | 0, hh = Math.ceil(e.hp), k = known.get(e.id); if (k === undefined || k.x !== x || k.y !== y || k.a !== e.aim || k.h !== hh) { if (k !== undefined) { k.x = x; k.y = y; k.a = e.aim; k.h = hh; } else known.set(e.id, { x, y, a: e.aim, h: hh }); P.push([e.id, x, y, e.aim, hh]); } } /* numeric compare in place: no string built per entity per viewer per snapshot */
       }
     }
     for (const e of this.born) { /* bullets born AND dead between two snapshots: send them once (spawn point, travelled distance) so every shot is visible */
@@ -1396,7 +1401,7 @@ export class MatchRoom {
       known.set(e.id, 1); B.push([e.id, e.sx | 0, e.sy | 0, e.vx | 0, e.vy | 0, e.o, Math.hypot(e.x - e.sx, e.y - e.sy) | 0]);
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h), this.skillExtra(h, f, Date.now(), x0, x1, y0, y1)]);
+    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h), this.skillExtra(h, f, nowT, x0, x1, y0, y1)], 1);
   }
 
   finish(now, reason) {
@@ -1453,11 +1458,15 @@ export class MatchRoom {
     try { await this.env.RL.put('rbr:pend:' + this.mid, body, { expirationTtl: 604800 }); } catch {} // cron flushes it later
   }
 
+  perf(secs) { /* latency / cost counters (cheap averages and maxima; no per-tick logging) */
+    const a = (s, n) => (n ? +(s / n).toFixed(3) : 0), m = (v) => +Number(v).toFixed(3);
+    return { hz: C.TICK_HZ, snapEvery: C.SNAP_EVERY, inApplyAvgMs: a(this.iSum, this.iN), inApplyMaxMs: m(this.iMax), inApplied: this.iN, simAvgMs: a(this.simSum, this.simN), simMaxMs: m(this.simMax), snapBuildAvgMs: a(this.sbSum, this.sbN), snapBuildMaxMs: m(this.sbMax), serAvgMs: a(this.sdSum, this.snN), serMaxMs: m(this.sdMax), tickAvgMs: a(this.tkSum, this.tkN), tickMaxMs: m(this.tkMax), snapAvgB: this.snN ? Math.round(this.snB / this.snN) : 0, snapMaxB: this.snBMax, snapsSent: this.snN, snapPerPlayerHz: secs > 0 && this.humans() ? +(this.snN / secs / this.humans()).toFixed(1) : 0, wsSendPerS: secs > 0 ? Math.round(this.wsN / secs) : 0 };
+  }
   stats() {
     const secs = this.startAt ? ((this.endAt || Date.now()) - this.startAt) / 1000 : 0;
     const reqs = this.msgsMatch / 20 + this.humans();
     const gbs = C.DO_MEM_GB * secs;
     const cost = (reqs * C.PRICE_REQ_PER_M) / 1e6 + (gbs * C.PRICE_GBS_PER_M) / 1e6;
-    return { lagAvgMs: this.lagN ? +(this.lagSum / this.lagN).toFixed(2) : 0, lagMaxMs: Math.round(this.lagMax), lateTicks: this.late, ticks: this.lagN, outKB: Math.round(this.bytesOut / 1024), mid: this.mid, mode: this.mode, teams: this.teams, state: this.state, humans: this.humans(), players: this.players.size, msgsInMatch: this.msgsMatch, msgsInTotal: this.msgsIn, matchSecs: Math.round(secs), billedReqEst: Math.round(reqs), socketSecs: Math.round(this.sockMs / 1000), costUsdEst: +cost.toFixed(5) };
+    return { ...this.perf(secs), lagAvgMs: this.lagN ? +(this.lagSum / this.lagN).toFixed(2) : 0, lagMaxMs: Math.round(this.lagMax), lateTicks: this.late, ticks: this.lagN, outKB: Math.round(this.bytesOut / 1024), mid: this.mid, mode: this.mode, teams: this.teams, state: this.state, humans: this.humans(), players: this.players.size, msgsInMatch: this.msgsMatch, msgsInTotal: this.msgsIn, matchSecs: Math.round(secs), billedReqEst: Math.round(reqs), socketSecs: Math.round(this.sockMs / 1000), costUsdEst: +cost.toFixed(5) };
   }
 }
