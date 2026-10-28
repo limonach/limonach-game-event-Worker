@@ -23,7 +23,7 @@ const C = {
   PRICE_REQ_PER_M: 0.15, PRICE_GBS_PER_M: 12.5, DO_MEM_GB: 0.128 // TUNE: check current Cloudflare pricing
 };
 
-const K = { SESSION_MS: 4 * 3600 * 1000, TG_MAX_AGE_S: 86400, JOIN_MS: 30000, OPEN_MS: 35000, PARTY_MAX: 4, PARTY_TTL_MS: 1800000, TEAM: { solo: 1, duo: 2, squad: 4 }, RL: { auth: 20, join: 15, party: 40, stats: 30, shop: 30, pass: 90 } }; // TUNE
+const K = { SESSION_MS: 4 * 3600 * 1000, TG_MAX_AGE_S: 86400, JOIN_MS: 30000, OPEN_MS: 28000, PARTY_MAX: 4, PARTY_TTL_MS: 1800000, TEAM: { solo: 1, duo: 2, squad: 4 }, RL: { auth: 20, join: 15, party: 40, stats: 30, shop: 30, pass: 90 } }; // TUNE
 const COS_ID = /^(hull|cannon|track|detail|glow|bullet|trail|blast|smoke|flag)_[a-z0-9]{2,12}$/;
 const GEM_PACKS = [[100, 99], [310, 299], [520, 499], [1060, 999], [2180, 1999], [5600, 4999]]; /* gems, price in USD cents (display + audit; real payments are not built yet) */
 const pickCos = (rows) => { const got = {}; for (const r of Array.isArray(rows) ? rows : []) { const m = r && typeof r.cosmetic_id === 'string' ? COS_ID.exec(r.cosmetic_id) : null; if (m && !got[m[1]]) got[m[1]] = r.cosmetic_id; } return Object.values(got).join(','); }; // one equipped id per type, validated
@@ -799,7 +799,7 @@ export default {
           const [st, j] = await mmCall(env, '/join', { u: ses.u, md: b.mode, cap: env.LOADTEST === '1' && Number.isInteger(b.cap) ? b.cap : 0 });
           if (st !== 200) return J({ e: j.e || 'err' }, st, cors);
           const t = await mkTok(env, 'J1.', { u: ses.u, pid: ses.pid, m: j.m, md: j.md, pt: j.pt, cs, nm, pm, wp, sk, exp: Date.now() + K.JOIN_MS, n: hex(8) });
-          return J({ t, md: j.md, m: j.m }, 200, cors);
+          return J({ t, md: j.md, m: j.m, l: Number.isFinite(j.l) ? j.l : 0 }, 200, cors);
         }
         const [st, j] = await mmCall(env, P, { u: ses.u, code: b.code });
         return J(j, st, cors);
@@ -823,11 +823,12 @@ export class Matchmaker {
     for (const [u, e] of this.um) if (now - e.t > 1200000) this.um.delete(u);
     if (this.last.size > 2000) this.last.clear();
   }
+  left(s, now) { return Math.max(0, Math.round(C.LOBBY_MS - (now - (s || now)))); } /* ms left of the lobby of a room, so the client can decide about the entry ad */
   drop(c) { const p = this.parties.get(c); if (!p) return; for (const u of p.members) if (this.up.get(u) === c) this.up.delete(u); this.parties.delete(c); }
   slot(md, n, now, cap) {
     let o = this.open[md];
     if (!o || o.n + n > (cap || C.MAX_PLAYERS) || now - o.since > K.OPEN_MS) o = this.open[md] = { m: crypto.randomUUID(), since: now, n: 0 };
-    o.n += n; return o.m;
+    o.n += n; return o; /* the slot object: { m, since, n } */
   }
   async fetch(req) {
     let b = {}; try { b = await req.json(); } catch {}
@@ -858,16 +859,16 @@ export class Matchmaker {
     if (P === '/join') {
       const md = b.md, cur = this.um.get(u), cap = (b.cap | 0) > 0 ? Math.min(b.cap | 0, C.MAX_PLAYERS) : 0;
       if (!K.TEAM[md]) return J({ e: 'bad' }, 400);
-      if (cur) return J({ m: cur.m, md: cur.md, pt: cur.pt }); // one active match per user: re-issue a token for the same match
+      if (cur) return J({ m: cur.m, md: cur.md, pt: cur.pt, l: this.left(cur.s, now) }); // one active match per user: re-issue a token for the same match
       if (pa) {
         if (!pa.match) {
           if (pa.leader !== u) return J({ e: 'leader' }, 409);
-          pa.match = { m: this.slot(md, pa.members.size, now, cap), md };
+          { const sl = this.slot(md, pa.members.size, now, cap); pa.match = { m: sl.m, md, s: sl.since }; }
         }
-        this.um.set(u, { m: pa.match.m, md: pa.match.md, pt: code, t: now });
-        return J({ m: pa.match.m, md: pa.match.md, pt: code });
+        this.um.set(u, { m: pa.match.m, md: pa.match.md, pt: code, t: now, s: pa.match.s });
+        return J({ m: pa.match.m, md: pa.match.md, pt: code, l: this.left(pa.match.s, now) });
       }
-      const m = this.slot(md, 1, now, cap); this.um.set(u, { m, md, pt: '', t: now }); return J({ m, md, pt: '' });
+      const sl = this.slot(md, 1, now, cap); this.um.set(u, { m: sl.m, md, pt: '', t: now, s: sl.since }); return J({ m: sl.m, md, pt: '', l: this.left(sl.since, now) });
     }
     if (P === '/leave') {
       const cur = this.um.get(u);
@@ -1401,7 +1402,7 @@ export class MatchRoom {
       known.set(e.id, 1); B.push([e.id, e.sx | 0, e.sy | 0, e.vx | 0, e.vy | 0, e.o, Math.hypot(e.x - e.sx, e.y - e.sy) | 0]);
     }
     const G = []; for (const id of known.keys()) if (!seen.has(id)) { G.push(id); known.delete(id); }
-    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h), this.skillExtra(h, f, nowT, x0, x1, y0, y1)], 1);
+    this.send(h.ws, [1, this.tickN, h.ack, [f.x | 0, f.y | 0, Math.ceil(Math.max(0, h.hp)), h.alive ? 1 : 0, h.kills, h.aim, Math.round(h.shield), h.maxHp | 0, h.xp, h.lvl, h.w, Math.round(this.score(h))], P, B, G, zArr, alive, el | 0, L, this.tm(h), this.skillExtra(h, f, nowT, x0, x1, y0, y1), h.lastIn ? Math.min(2000, Math.max(0, nowT - h.lastIn)) : -1], 1); /* [13] = ms between the last input you sent and this snapshot: the client compares the server state with its OWN position at (send time + that), no ping estimate needed */
   }
 
   finish(now, reason) {
