@@ -28,6 +28,10 @@ class_name = "Matchmaker"
 name = "RLIM"
 class_name = "RateLimiter"
 
+[[durable_objects.bindings]]
+name = "PRES"
+class_name = "Presence"   # friends online status + party invites (memory only)
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MatchRoom"]
@@ -39,6 +43,10 @@ new_sqlite_classes = ["Matchmaker"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["RateLimiter"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["Presence"]
 
 [[kv_namespaces]]
 binding = "RL"
